@@ -1,1715 +1,2308 @@
-/*!
- * ECharts, a javascript interactive chart library.
- *  
- * Copyright (c) 2015, Baidu Inc.
- * All rights reserved.
- * 
- * LICENSE
- * https://github.com/ecomfe/echarts/blob/master/LICENSE.txt
- */
+/*
+* Licensed to the Apache Software Foundation (ASF) under one
+* or more contributor license agreements.  See the NOTICE file
+* distributed with this work for additional information
+* regarding copyright ownership.  The ASF licenses this file
+* to you under the Apache License, Version 2.0 (the
+* "License"); you may not use this file except in compliance
+* with the License.  You may obtain a copy of the License at
+*
+*   http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing,
+* software distributed under the License is distributed on an
+* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+* KIND, either express or implied.  See the License for the
+* specific language governing permissions and limitations
+* under the License.
+*/
+import {__DEV__} from './config';
+import * as zrender from 'zrender/src/zrender';
+import * as zrUtil from 'zrender/src/core/util';
+import * as colorTool from 'zrender/src/tool/color';
+import env from 'zrender/src/core/env';
+import timsort from 'zrender/src/core/timsort';
+import Eventful from 'zrender/src/mixin/Eventful';
+import GlobalModel from './model/Global';
+import ExtensionAPI from './ExtensionAPI';
+import CoordinateSystemManager from './CoordinateSystem';
+import OptionManager from './model/OptionManager';
+import backwardCompat from './preprocessor/backwardCompat';
+import dataStack from './processor/dataStack';
+import ComponentModel from './model/Component';
+import SeriesModel from './model/Series';
+import ComponentView from './view/Component';
+import ChartView from './view/Chart';
+import * as graphic from './util/graphic';
+import * as modelUtil from './util/model';
+import {throttle} from './util/throttle';
+import seriesColor from './visual/seriesColor';
+import aria from './visual/aria';
+import loadingDefault from './loading/default';
+import Scheduler from './stream/Scheduler';
+import lightTheme from './theme/light';
+import darkTheme from './theme/dark';
+import './component/dataset';
+import mapDataStorage from './coord/geo/mapDataStorage';
+
+var assert = zrUtil.assert;
+var each = zrUtil.each;
+var isFunction = zrUtil.isFunction;
+var isObject = zrUtil.isObject;
+var parseClassType = ComponentModel.parseClassType;
+
+export var version = '4.1.0';
+
+export var dependencies = {
+    zrender: '4.0.4'
+};
+
+var TEST_FRAME_REMAIN_TIME = 1;
+
+var PRIORITY_PROCESSOR_FILTER = 1000;
+var PRIORITY_PROCESSOR_STATISTIC = 5000;
+
+var PRIORITY_VISUAL_LAYOUT = 1000;
+var PRIORITY_VISUAL_GLOBAL = 2000;
+var PRIORITY_VISUAL_CHART = 3000;
+var PRIORITY_VISUAL_COMPONENT = 4000;
+// FIXME
+// necessary?
+var PRIORITY_VISUAL_BRUSH = 5000;
+
+export var PRIORITY = {
+    PROCESSOR: {
+        FILTER: PRIORITY_PROCESSOR_FILTER,
+        STATISTIC: PRIORITY_PROCESSOR_STATISTIC
+    },
+    VISUAL: {
+        LAYOUT: PRIORITY_VISUAL_LAYOUT,
+        GLOBAL: PRIORITY_VISUAL_GLOBAL,
+        CHART: PRIORITY_VISUAL_CHART,
+        COMPONENT: PRIORITY_VISUAL_COMPONENT,
+        BRUSH: PRIORITY_VISUAL_BRUSH
+    }
+};
+
+// Main process have three entries: `setOption`, `dispatchAction` and `resize`,
+// where they must not be invoked nestedly, except the only case: invoke
+// dispatchAction with updateMethod "none" in main process.
+// This flag is used to carry out this rule.
+// All events will be triggered out side main process (i.e. when !this[IN_MAIN_PROCESS]).
+var IN_MAIN_PROCESS = '__flagInMainProcess';
+var OPTION_UPDATED = '__optionUpdated';
+var ACTION_REG = /^[a-zA-Z0-9_]+$/;
+
+
+function createRegisterEventWithLowercaseName(method) {
+    return function (eventName, handler, context) {
+        // Event name is all lowercase
+        eventName = eventName && eventName.toLowerCase();
+        Eventful.prototype[method].call(this, eventName, handler, context);
+    };
+}
 
 /**
- * echarts
- *
- * @desc echarts基于Canvas，纯Javascript图表库，提供直观，生动，可交互，可个性化定制的数据统计图表。
- * @author Kener (@Kener-林峰, kener.linfeng@gmail.com)
- *
+ * @module echarts~MessageCenter
  */
-define(function (require) {
-    var ecConfig = require('./config');
-    var zrUtil = require('zrender/tool/util');
-    var zrEvent = require('zrender/tool/event');
-    
-    var self = {};
-    
-    var _canvasSupported = require('zrender/tool/env').canvasSupported;
-    var _idBase = new Date() - 0;
-    var _instances = {};    // ECharts实例map索引
-    var DOM_ATTRIBUTE_KEY = '_echarts_instance_';
-    
-    self.version = '2.1.10';
-    self.dependencies = {
-        zrender: '2.0.6'
-    };
-    /**
-     * 入口方法 
-     */
-    self.init = function (dom, theme) {
-        var zrender = require('zrender');
-        if (((zrender.version || '1.0.3').replace('.', '') - 0)
-            < (self.dependencies.zrender.replace('.', '') - 0)
-        ) {
-            console.error(
-                'ZRender ' + (zrender.version || '1.0.3-') 
-                + ' is too old for ECharts ' + self.version 
-                + '. Current version need ZRender ' 
-                + self.dependencies.zrender + '+'
-            );
-        }
-            
-        dom = dom instanceof Array ? dom[0] : dom;
+function MessageCenter() {
+    Eventful.call(this);
+}
+MessageCenter.prototype.on = createRegisterEventWithLowercaseName('on');
+MessageCenter.prototype.off = createRegisterEventWithLowercaseName('off');
+MessageCenter.prototype.one = createRegisterEventWithLowercaseName('one');
+zrUtil.mixin(MessageCenter, Eventful);
 
-        // dom与echarts实例映射索引
-        var key = dom.getAttribute(DOM_ATTRIBUTE_KEY);
-        if (!key) {
-            key = _idBase++;
-            dom.setAttribute(DOM_ATTRIBUTE_KEY, key);
-        }
+/**
+ * @module echarts~ECharts
+ */
+function ECharts(dom, theme, opts) {
+    opts = opts || {};
 
-        if (_instances[key]) {
-            // 同一个dom上多次init，自动释放已有实例
-            _instances[key].dispose();
-        }
-        _instances[key] = new Echarts(dom);
-        _instances[key].id = key;
-        _instances[key].canvasSupported = _canvasSupported;
-        _instances[key].setTheme(theme);
-        
-        return  _instances[key];
-    };
-    
-    /**
-     * 通过id获得ECharts实例，id可在实例化后读取 
-     */
-    self.getInstanceById = function (key) {
-        return _instances[key];
-    };
-
-    /**
-     * 消息中心
-     */
-    function MessageCenter() {
-        zrEvent.Dispatcher.call(this);
+    // Get theme by name
+    if (typeof theme === 'string') {
+        theme = themeStorage[theme];
     }
-    zrUtil.merge(MessageCenter.prototype, zrEvent.Dispatcher.prototype, true);
 
     /**
-     * 基于zrender实现Echarts接口层
-     * @param {HtmlElement} dom 必要
+     * @type {string}
      */
-    function Echarts(dom) {
-        // Fxxk IE11 for breaking initialization without a warrant;
-        // Just set something to let it be!
-        // by kener 2015-01-09
-        dom.innerHTML = '';
-        this._themeConfig = zrUtil.clone(ecConfig);
+    this.id;
 
-        this.dom = dom;
-        // this._zr;
-        // this._option;                    // curOption clone
-        // this._optionRestore;             // for restore;
-        // this._island;
-        // this._toolbox;
-        // this._timeline;
-        // this._refreshInside;             // 内部刷新标志位
-        
-        this._connected = false;
-        this._status = {                    // 用于图表间通信
-            dragIn: false,
-            dragOut: false,
-            needRefresh: false
-        };
-        this._curEventType = false;         // 破循环信号灯
-        this._chartList = [];               // 图表实例
-
-        this._messageCenter = new MessageCenter();
-
-        this._messageCenterOutSide = new MessageCenter();    // Echarts层的外部消息中心，做Echarts层的消息转发
-        
-        // resize方法经常被绑定到window.resize上，闭包一个this
-        this.resize = this.resize();
-        
-        // 初始化::构造函数
-        this._init();
-    }
-    
     /**
-     * ZRender EVENT
-     * 
-     * @inner
-     * @const
+     * Group id
+     * @type {string}
+     */
+    this.group;
+
+    /**
+     * @type {HTMLElement}
+     * @private
+     */
+    this._dom = dom;
+
+    var defaultRenderer = 'canvas';
+    if (__DEV__) {
+        defaultRenderer = (
+            typeof window === 'undefined' ? global : window
+        ).__ECHARTS__DEFAULT__RENDERER__ || defaultRenderer;
+    }
+
+    /**
+     * @type {module:zrender/ZRender}
+     * @private
+     */
+    var zr = this._zr = zrender.init(dom, {
+        renderer: opts.renderer || defaultRenderer,
+        devicePixelRatio: opts.devicePixelRatio,
+        width: opts.width,
+        height: opts.height
+    });
+
+    /**
+     * Expect 60 pfs.
+     * @type {Function}
+     * @private
+     */
+    this._throttledZrFlush = throttle(zrUtil.bind(zr.flush, zr), 17);
+
+    var theme = zrUtil.clone(theme);
+    theme && backwardCompat(theme, true);
+    /**
      * @type {Object}
+     * @private
      */
-    var ZR_EVENT = require('zrender/config').EVENT;
+    this._theme = theme;
 
     /**
-     * 要绑定监听的zrender事件列表
-     * 
-     * @const
-     * @inner
-     * @type {Array}
+     * @type {Array.<module:echarts/view/Chart>}
+     * @private
      */
-    var ZR_EVENT_LISTENS = [
-        'CLICK', 'DBLCLICK', 'MOUSEOVER', 'MOUSEOUT',
-        'DRAGSTART', 'DRAGEND', 'DRAGENTER', 'DRAGOVER', 'DRAGLEAVE', 'DROP'
-    ];
+    this._chartsViews = [];
 
     /**
-     * 对echarts的实例中的chartList属性成员，逐个进行方法调用，遍历顺序为逆序
-     * 由于在事件触发的默认行为处理中，多次用到相同逻辑，所以抽象了该方法
-     * 由于所有的调用场景里，最多只有两个参数，基于性能和体积考虑，这里就不使用call或者apply了
-     * 
-     * @inner
-     * @param {ECharts} ecInstance ECharts实例
-     * @param {string} methodName 要调用的方法名
-     * @param {*} arg0 调用参数1
-     * @param {*} arg1 调用参数2
-     * @param {*} arg2 调用参数3
+     * @type {Object.<string, module:echarts/view/Chart>}
+     * @private
      */
-    function callChartListMethodReverse(ecInstance, methodName, arg0, arg1, arg2) {
-        var chartList = ecInstance._chartList;
-        var len = chartList.length;
+    this._chartsMap = {};
 
-        while (len--) {
-            var chart = chartList[len];
-            if (typeof chart[methodName] === 'function') {
-                chart[methodName](arg0, arg1, arg2);
+    /**
+     * @type {Array.<module:echarts/view/Component>}
+     * @private
+     */
+    this._componentsViews = [];
+
+    /**
+     * @type {Object.<string, module:echarts/view/Component>}
+     * @private
+     */
+    this._componentsMap = {};
+
+    /**
+     * @type {module:echarts/CoordinateSystem}
+     * @private
+     */
+    this._coordSysMgr = new CoordinateSystemManager();
+
+    /**
+     * @type {module:echarts/ExtensionAPI}
+     * @private
+     */
+    var api = this._api = createExtensionAPI(this);
+
+    // Sort on demand
+    function prioritySortFunc(a, b) {
+        return a.__prio - b.__prio;
+    }
+    timsort(visualFuncs, prioritySortFunc);
+    timsort(dataProcessorFuncs, prioritySortFunc);
+
+    /**
+     * @type {module:echarts/stream/Scheduler}
+     */
+    this._scheduler = new Scheduler(this, api, dataProcessorFuncs, visualFuncs);
+
+    Eventful.call(this, this._ecEventProcessor = makeEventProcessor(this));
+
+    /**
+     * @type {module:echarts~MessageCenter}
+     * @private
+     */
+    this._messageCenter = new MessageCenter();
+
+    // Init mouse events
+    this._initEvents();
+
+    // In case some people write `window.onresize = chart.resize`
+    this.resize = zrUtil.bind(this.resize, this);
+
+    // Can't dispatch action during rendering procedure
+    this._pendingActions = [];
+
+    zr.animation.on('frame', this._onframe, this);
+
+    bindRenderedEvent(zr, this);
+
+    // ECharts instance can be used as value.
+    zrUtil.setAsPrimitive(this);
+}
+
+var echartsProto = ECharts.prototype;
+
+echartsProto._onframe = function () {
+    if (this._disposed) {
+        return;
+    }
+
+    var scheduler = this._scheduler;
+
+    // Lazy update
+    if (this[OPTION_UPDATED]) {
+        var silent = this[OPTION_UPDATED].silent;
+
+        this[IN_MAIN_PROCESS] = true;
+
+        prepare(this);
+        updateMethods.update.call(this);
+
+        this[IN_MAIN_PROCESS] = false;
+
+        this[OPTION_UPDATED] = false;
+
+        flushPendingActions.call(this, silent);
+
+        triggerUpdatedEvent.call(this, silent);
+    }
+    // Avoid do both lazy update and progress in one frame.
+    else if (scheduler.unfinished) {
+        // Stream progress.
+        var remainTime = TEST_FRAME_REMAIN_TIME;
+        var ecModel = this._model;
+        var api = this._api;
+        scheduler.unfinished = false;
+        do {
+            var startTime = +new Date();
+
+            scheduler.performSeriesTasks(ecModel);
+
+            // Currently dataProcessorFuncs do not check threshold.
+            scheduler.performDataProcessorTasks(ecModel);
+
+            updateStreamModes(this, ecModel);
+
+            // Do not update coordinate system here. Because that coord system update in
+            // each frame is not a good user experience. So we follow the rule that
+            // the extent of the coordinate system is determin in the first frame (the
+            // frame is executed immedietely after task reset.
+            // this._coordSysMgr.update(ecModel, api);
+
+            // console.log('--- ec frame visual ---', remainTime);
+            scheduler.performVisualTasks(ecModel);
+
+            renderSeries(this, this._model, api, 'remain');
+
+            remainTime -= (+new Date() - startTime);
+        }
+        while (remainTime > 0 && scheduler.unfinished);
+
+        // Call flush explicitly for trigger finished event.
+        if (!scheduler.unfinished) {
+            this._zr.flush();
+        }
+        // Else, zr flushing be ensue within the same frame,
+        // because zr flushing is after onframe event.
+    }
+};
+
+/**
+ * @return {HTMLElement}
+ */
+echartsProto.getDom = function () {
+    return this._dom;
+};
+
+/**
+ * @return {module:zrender~ZRender}
+ */
+echartsProto.getZr = function () {
+    return this._zr;
+};
+
+/**
+ * Usage:
+ * chart.setOption(option, notMerge, lazyUpdate);
+ * chart.setOption(option, {
+ *     notMerge: ...,
+ *     lazyUpdate: ...,
+ *     silent: ...
+ * });
+ *
+ * @param {Object} option
+ * @param {Object|boolean} [opts] opts or notMerge.
+ * @param {boolean} [opts.notMerge=false]
+ * @param {boolean} [opts.lazyUpdate=false] Useful when setOption frequently.
+ */
+echartsProto.setOption = function (option, notMerge, lazyUpdate) {
+    if (__DEV__) {
+        assert(!this[IN_MAIN_PROCESS], '`setOption` should not be called during main process.');
+    }
+
+    var silent;
+    if (isObject(notMerge)) {
+        lazyUpdate = notMerge.lazyUpdate;
+        silent = notMerge.silent;
+        notMerge = notMerge.notMerge;
+    }
+
+    this[IN_MAIN_PROCESS] = true;
+
+    if (!this._model || notMerge) {
+        var optionManager = new OptionManager(this._api);
+        var theme = this._theme;
+        var ecModel = this._model = new GlobalModel(null, null, theme, optionManager);
+        ecModel.scheduler = this._scheduler;
+        ecModel.init(null, null, theme, optionManager);
+    }
+
+    this._model.setOption(option, optionPreprocessorFuncs);
+
+    if (lazyUpdate) {
+        this[OPTION_UPDATED] = {silent: silent};
+        this[IN_MAIN_PROCESS] = false;
+    }
+    else {
+        prepare(this);
+
+        updateMethods.update.call(this);
+
+        // Ensure zr refresh sychronously, and then pixel in canvas can be
+        // fetched after `setOption`.
+        this._zr.flush();
+
+        this[OPTION_UPDATED] = false;
+        this[IN_MAIN_PROCESS] = false;
+
+        flushPendingActions.call(this, silent);
+        triggerUpdatedEvent.call(this, silent);
+    }
+};
+
+/**
+ * @DEPRECATED
+ */
+echartsProto.setTheme = function () {
+    console.log('ECharts#setTheme() is DEPRECATED in ECharts 3.0');
+};
+
+/**
+ * @return {module:echarts/model/Global}
+ */
+echartsProto.getModel = function () {
+    return this._model;
+};
+
+/**
+ * @return {Object}
+ */
+echartsProto.getOption = function () {
+    return this._model && this._model.getOption();
+};
+
+/**
+ * @return {number}
+ */
+echartsProto.getWidth = function () {
+    return this._zr.getWidth();
+};
+
+/**
+ * @return {number}
+ */
+echartsProto.getHeight = function () {
+    return this._zr.getHeight();
+};
+
+/**
+ * @return {number}
+ */
+echartsProto.getDevicePixelRatio = function () {
+    return this._zr.painter.dpr || window.devicePixelRatio || 1;
+};
+
+/**
+ * Get canvas which has all thing rendered
+ * @param {Object} opts
+ * @param {string} [opts.backgroundColor]
+ * @return {string}
+ */
+echartsProto.getRenderedCanvas = function (opts) {
+    if (!env.canvasSupported) {
+        return;
+    }
+    opts = opts || {};
+    opts.pixelRatio = opts.pixelRatio || 1;
+    opts.backgroundColor = opts.backgroundColor
+        || this._model.get('backgroundColor');
+    var zr = this._zr;
+    // var list = zr.storage.getDisplayList();
+    // Stop animations
+    // Never works before in init animation, so remove it.
+    // zrUtil.each(list, function (el) {
+    //     el.stopAnimation(true);
+    // });
+    return zr.painter.getRenderedCanvas(opts);
+};
+
+/**
+ * Get svg data url
+ * @return {string}
+ */
+echartsProto.getSvgDataUrl = function () {
+    if (!env.svgSupported) {
+        return;
+    }
+
+    var zr = this._zr;
+    var list = zr.storage.getDisplayList();
+    // Stop animations
+    zrUtil.each(list, function (el) {
+        el.stopAnimation(true);
+    });
+
+    return zr.painter.pathToDataUrl();
+};
+
+/**
+ * @return {string}
+ * @param {Object} opts
+ * @param {string} [opts.type='png']
+ * @param {string} [opts.pixelRatio=1]
+ * @param {string} [opts.backgroundColor]
+ * @param {string} [opts.excludeComponents]
+ */
+echartsProto.getDataURL = function (opts) {
+    opts = opts || {};
+    var excludeComponents = opts.excludeComponents;
+    var ecModel = this._model;
+    var excludesComponentViews = [];
+    var self = this;
+
+    each(excludeComponents, function (componentType) {
+        ecModel.eachComponent({
+            mainType: componentType
+        }, function (component) {
+            var view = self._componentsMap[component.__viewId];
+            if (!view.group.ignore) {
+                excludesComponentViews.push(view);
+                view.group.ignore = true;
             }
+        });
+    });
+
+    var url = this._zr.painter.getType() === 'svg'
+        ? this.getSvgDataUrl()
+        : this.getRenderedCanvas(opts).toDataURL(
+            'image/' + (opts && opts.type || 'png')
+        );
+
+    each(excludesComponentViews, function (view) {
+        view.group.ignore = false;
+    });
+
+    return url;
+};
+
+
+/**
+ * @return {string}
+ * @param {Object} opts
+ * @param {string} [opts.type='png']
+ * @param {string} [opts.pixelRatio=1]
+ * @param {string} [opts.backgroundColor]
+ */
+echartsProto.getConnectedDataURL = function (opts) {
+    if (!env.canvasSupported) {
+        return;
+    }
+    var groupId = this.group;
+    var mathMin = Math.min;
+    var mathMax = Math.max;
+    var MAX_NUMBER = Infinity;
+    if (connectedGroups[groupId]) {
+        var left = MAX_NUMBER;
+        var top = MAX_NUMBER;
+        var right = -MAX_NUMBER;
+        var bottom = -MAX_NUMBER;
+        var canvasList = [];
+        var dpr = (opts && opts.pixelRatio) || 1;
+
+        zrUtil.each(instances, function (chart, id) {
+            if (chart.group === groupId) {
+                var canvas = chart.getRenderedCanvas(
+                    zrUtil.clone(opts)
+                );
+                var boundingRect = chart.getDom().getBoundingClientRect();
+                left = mathMin(boundingRect.left, left);
+                top = mathMin(boundingRect.top, top);
+                right = mathMax(boundingRect.right, right);
+                bottom = mathMax(boundingRect.bottom, bottom);
+                canvasList.push({
+                    dom: canvas,
+                    left: boundingRect.left,
+                    top: boundingRect.top
+                });
+            }
+        });
+
+        left *= dpr;
+        top *= dpr;
+        right *= dpr;
+        bottom *= dpr;
+        var width = right - left;
+        var height = bottom - top;
+        var targetCanvas = zrUtil.createCanvas();
+        targetCanvas.width = width;
+        targetCanvas.height = height;
+        var zr = zrender.init(targetCanvas);
+
+        each(canvasList, function (item) {
+            var img = new graphic.Image({
+                style: {
+                    x: item.left * dpr - left,
+                    y: item.top * dpr - top,
+                    image: item.dom
+                }
+            });
+            zr.add(img);
+        });
+        zr.refreshImmediately();
+
+        return targetCanvas.toDataURL('image/' + (opts && opts.type || 'png'));
+    }
+    else {
+        return this.getDataURL(opts);
+    }
+};
+
+/**
+ * Convert from logical coordinate system to pixel coordinate system.
+ * See CoordinateSystem#convertToPixel.
+ * @param {string|Object} finder
+ *        If string, e.g., 'geo', means {geoIndex: 0}.
+ *        If Object, could contain some of these properties below:
+ *        {
+ *            seriesIndex / seriesId / seriesName,
+ *            geoIndex / geoId, geoName,
+ *            bmapIndex / bmapId / bmapName,
+ *            xAxisIndex / xAxisId / xAxisName,
+ *            yAxisIndex / yAxisId / yAxisName,
+ *            gridIndex / gridId / gridName,
+ *            ... (can be extended)
+ *        }
+ * @param {Array|number} value
+ * @return {Array|number} result
+ */
+echartsProto.convertToPixel = zrUtil.curry(doConvertPixel, 'convertToPixel');
+
+/**
+ * Convert from pixel coordinate system to logical coordinate system.
+ * See CoordinateSystem#convertFromPixel.
+ * @param {string|Object} finder
+ *        If string, e.g., 'geo', means {geoIndex: 0}.
+ *        If Object, could contain some of these properties below:
+ *        {
+ *            seriesIndex / seriesId / seriesName,
+ *            geoIndex / geoId / geoName,
+ *            bmapIndex / bmapId / bmapName,
+ *            xAxisIndex / xAxisId / xAxisName,
+ *            yAxisIndex / yAxisId / yAxisName
+ *            gridIndex / gridId / gridName,
+ *            ... (can be extended)
+ *        }
+ * @param {Array|number} value
+ * @return {Array|number} result
+ */
+echartsProto.convertFromPixel = zrUtil.curry(doConvertPixel, 'convertFromPixel');
+
+function doConvertPixel(methodName, finder, value) {
+    var ecModel = this._model;
+    var coordSysList = this._coordSysMgr.getCoordinateSystems();
+    var result;
+
+    finder = modelUtil.parseFinder(ecModel, finder);
+
+    for (var i = 0; i < coordSysList.length; i++) {
+        var coordSys = coordSysList[i];
+        if (coordSys[methodName]
+            && (result = coordSys[methodName](ecModel, finder, value)) != null
+        ) {
+            return result;
         }
     }
 
-    Echarts.prototype = {
-        /**
-         * 初始化::构造函数
-         */ 
-        _init: function () {
-            var self = this;
-            var _zr = require('zrender').init(this.dom);
-            this._zr = _zr;
-            
-            // wrap: n,e,d,t for name event data this
-            this._messageCenter.dispatch = function(type, event, eventPackage, that) {
-                eventPackage = eventPackage || {};
-                eventPackage.type = type;
-                eventPackage.event = event;
+    if (__DEV__) {
+        console.warn(
+            'No coordinate system that supports ' + methodName + ' found by the given finder.'
+        );
+    }
+}
 
-                self._messageCenter.dispatchWithContext(type, eventPackage, that);
-                if (type != 'HOVER' && type != 'MOUSEOUT') {    // 频繁事件直接抛出
-                    setTimeout(function(){
-                        self._messageCenterOutSide.dispatchWithContext(
-                            type, eventPackage, that
-                        );
-                    },50);
+/**
+ * Is the specified coordinate systems or components contain the given pixel point.
+ * @param {string|Object} finder
+ *        If string, e.g., 'geo', means {geoIndex: 0}.
+ *        If Object, could contain some of these properties below:
+ *        {
+ *            seriesIndex / seriesId / seriesName,
+ *            geoIndex / geoId / geoName,
+ *            bmapIndex / bmapId / bmapName,
+ *            xAxisIndex / xAxisId / xAxisName,
+ *            yAxisIndex / yAxisId / yAxisName,
+ *            gridIndex / gridId / gridName,
+ *            ... (can be extended)
+ *        }
+ * @param {Array|number} value
+ * @return {boolean} result
+ */
+echartsProto.containPixel = function (finder, value) {
+    var ecModel = this._model;
+    var result;
+
+    finder = modelUtil.parseFinder(ecModel, finder);
+
+    zrUtil.each(finder, function (models, key) {
+        key.indexOf('Models') >= 0 && zrUtil.each(models, function (model) {
+            var coordSys = model.coordinateSystem;
+            if (coordSys && coordSys.containPoint) {
+                result |= !!coordSys.containPoint(value);
+            }
+            else if (key === 'seriesModels') {
+                var view = this._chartsMap[model.__viewId];
+                if (view && view.containPoint) {
+                    result |= view.containPoint(value, model);
                 }
                 else {
-                    self._messageCenterOutSide.dispatchWithContext(
-                        type, eventPackage, that
-                    );
-                }
-            };
-            
-            this._onevent = function(param){
-                return self.__onevent(param);
-            };
-            for (var e in ecConfig.EVENT) {
-                if (e != 'CLICK' && e != 'DBLCLICK' 
-                    && e != 'HOVER' && e != 'MOUSEOUT' && e != 'MAP_ROAM'
-                ) {
-                    this._messageCenter.bind(ecConfig.EVENT[e], this._onevent, this);
-                }
-            }
-
-
-            var eventBehaviors = {};
-            this._onzrevent = function (param) {
-                return self[eventBehaviors[ param.type ]](param);
-            };
-
-            // 挂载关心的事件
-            for (var i = 0, len = ZR_EVENT_LISTENS.length; i < len; i++) {
-                var eventName = ZR_EVENT_LISTENS[i];
-                var eventValue = ZR_EVENT[eventName];
-                eventBehaviors[eventValue] = '_on' + eventName.toLowerCase();
-                _zr.on(eventValue, this._onzrevent);
-            }
-
-            this.chart = {};            // 图表索引
-            this.component = {};        // 组件索引
-            
-            // 内置图表
-            // 孤岛
-            var Island = require('./chart/island');
-            this._island = new Island(this._themeConfig, this._messageCenter, _zr, {}, this);
-            this.chart.island = this._island;
-            
-            // 内置通用组件
-            // 工具箱
-            var Toolbox = require('./component/toolbox');
-            this._toolbox = new Toolbox(this._themeConfig, this._messageCenter, _zr, {}, this);
-            this.component.toolbox = this._toolbox;
-            
-            var componentLibrary = require('./component');
-            componentLibrary.define('title', require('./component/title'));
-            componentLibrary.define('tooltip', require('./component/tooltip'));
-            componentLibrary.define('legend', require('./component/legend'));
-            
-            if (_zr.getWidth() === 0 || _zr.getHeight() === 0) {
-                console.error('Dom’s width & height should be ready before init.');
-            }
-        },
-
-        /**
-         * ECharts事件处理中心 
-         */
-        __onevent: function (param){
-            param.__echartsId = param.__echartsId || this.id;
-
-            // 来自其他联动图表的事件
-            var fromMyself = (param.__echartsId === this.id);
-            
-            if (!this._curEventType) {
-                this._curEventType = param.type;
-            }
-            
-            switch (param.type) {
-                case ecConfig.EVENT.LEGEND_SELECTED :
-                    this._onlegendSelected(param);
-                    break;
-                case ecConfig.EVENT.DATA_ZOOM :
-                    if (!fromMyself) {
-                        var dz = this.component.dataZoom;
-                        if (dz) {
-                            dz.silence(true);
-                            dz.absoluteZoom(param.zoom);
-                            dz.silence(false);
-                        }
+                    if (__DEV__) {
+                        console.warn(key + ': ' + (view
+                            ? 'The found component do not support containPoint.'
+                            : 'No view mapping to the found component.'
+                        ));
                     }
-                    this._ondataZoom(param);
-                    break;        
-                case ecConfig.EVENT.DATA_RANGE :
-                    fromMyself && this._ondataRange(param);
-                    break;        
-                case ecConfig.EVENT.MAGIC_TYPE_CHANGED :
-                    if (!fromMyself) {
-                        var tb = this.component.toolbox;
-                        if (tb) {
-                            tb.silence(true);
-                            tb.setMagicType(param.magicType);
-                            tb.silence(false);
-                        }
-                    }
-                    this._onmagicTypeChanged(param);
-                    break;        
-                case ecConfig.EVENT.DATA_VIEW_CHANGED :
-                    fromMyself && this._ondataViewChanged(param);
-                    break;        
-                case ecConfig.EVENT.TOOLTIP_HOVER :
-                    fromMyself && this._tooltipHover(param);
-                    break;        
-                case ecConfig.EVENT.RESTORE :
-                    this._onrestore();
-                    break;        
-                case ecConfig.EVENT.REFRESH :
-                    fromMyself && this._onrefresh(param);
-                    break;
-                // 鼠标同步
-                case ecConfig.EVENT.TOOLTIP_IN_GRID :
-                case ecConfig.EVENT.TOOLTIP_OUT_GRID :
-                    if (!fromMyself) {
-                        // 只处理来自外部的鼠标同步
-                        var grid = this.component.grid;
-                        if (grid) {
-                            this._zr.trigger(
-                                'mousemove',
-                                {
-                                    connectTrigger: true,
-                                    zrenderX: grid.getX() + param.x * grid.getWidth(),
-                                    zrenderY: grid.getY() + param.y * grid.getHeight()
-                                }
-                            );
-                        }
-                    } 
-                    else if (this._connected) {
-                        // 来自自己，并且存在多图联动，空间坐标映射修改参数分发
-                        var grid = this.component.grid;
-                        if (grid) {
-                            param.x = (param.event.zrenderX - grid.getX()) / grid.getWidth();
-                            param.y = (param.event.zrenderY - grid.getY()) / grid.getHeight();
-                        }
-                    }
-                    break;
-                /*
-                case ecConfig.EVENT.RESIZE :
-                case ecConfig.EVENT.DATA_CHANGED :
-                case ecConfig.EVENT.PIE_SELECTED :
-                case ecConfig.EVENT.MAP_SELECTED :
-                    break;
-                */
-            }
-            
-            // 多图联动，只做自己的一级事件分发，避免级联事件循环
-            if (this._connected && fromMyself && this._curEventType === param.type) { 
-                for (var c in this._connected) {
-                    this._connected[c].connectedEventHandler(param);
-                }
-                // 分发完毕后复位
-                this._curEventType = null;
-            }
-            
-            if (!fromMyself || (!this._connected && fromMyself)) {  // 处理了完联动事件复位
-                this._curEventType = null;
-            }
-        },
-
-        /**
-         * 点击事件，响应zrender事件，包装后分发到Echarts层
-         */
-        _onclick: function (param) {
-            callChartListMethodReverse(this, 'onclick', param);
-
-            if (param.target) {
-                var ecData = this._eventPackage(param.target);
-                if (ecData && ecData.seriesIndex != null) {
-                    this._messageCenter.dispatch(
-                        ecConfig.EVENT.CLICK,
-                        param.event,
-                        ecData,
-                        this
-                    );
                 }
             }
-        },
-        
-        /**
-         * 双击事件，响应zrender事件，包装后分发到Echarts层
-         */
-        _ondblclick: function (param) {
-            callChartListMethodReverse(this, 'ondblclick', param);
-
-            if (param.target) {
-                var ecData = this._eventPackage(param.target);
-                if (ecData && ecData.seriesIndex != null) {
-                    this._messageCenter.dispatch(
-                        ecConfig.EVENT.DBLCLICK,
-                        param.event,
-                        ecData,
-                        this
-                    );
+            else {
+                if (__DEV__) {
+                    console.warn(key + ': containPoint is not supported');
                 }
             }
-        },
+        }, this);
+    }, this);
 
-        /**
-         * 鼠标移入事件，响应zrender事件，包装后分发到Echarts层
-         */
-        _onmouseover: function (param) {
-            if (param.target) {
-                var ecData = this._eventPackage(param.target);
-                if (ecData && ecData.seriesIndex != null) {
-                    this._messageCenter.dispatch(
-                        ecConfig.EVENT.HOVER,
-                        param.event,
-                        ecData,
-                        this
-                    );
-                }
-            }
-        },
-        
-        /**
-         * 鼠标移出事件，响应zrender事件，包装后分发到Echarts层
-         */
-        _onmouseout: function (param) {
-            if (param.target) {
-                var ecData = this._eventPackage(param.target);
-                if (ecData && ecData.seriesIndex != null) {
-                    this._messageCenter.dispatch(
-                        ecConfig.EVENT.MOUSEOUT,
-                        param.event,
-                        ecData,
-                        this
-                    );
-                }
-            }
-        },
+    return !!result;
+};
 
-        /**
-         * dragstart回调，可计算特性实现
-         */
-        _ondragstart: function (param) {
-            // 复位用于图表间通信拖拽标识
-            this._status = {
-                dragIn: false,
-                dragOut: false,
-                needRefresh: false
-            };
+/**
+ * Get visual from series or data.
+ * @param {string|Object} finder
+ *        If string, e.g., 'series', means {seriesIndex: 0}.
+ *        If Object, could contain some of these properties below:
+ *        {
+ *            seriesIndex / seriesId / seriesName,
+ *            dataIndex / dataIndexInside
+ *        }
+ *        If dataIndex is not specified, series visual will be fetched,
+ *        but not data item visual.
+ *        If all of seriesIndex, seriesId, seriesName are not specified,
+ *        visual will be fetched from first series.
+ * @param {string} visualType 'color', 'symbol', 'symbolSize'
+ */
+echartsProto.getVisual = function (finder, visualType) {
+    var ecModel = this._model;
 
-            callChartListMethodReverse(this, 'ondragstart', param);
-        },
+    finder = modelUtil.parseFinder(ecModel, finder, {defaultMainType: 'series'});
 
-        /**
-         * dragging回调，可计算特性实现
-         */
-        _ondragenter: function (param) {
-            callChartListMethodReverse(this, 'ondragenter', param);
-        },
+    var seriesModel = finder.seriesModel;
 
-        /**
-         * dragstart回调，可计算特性实现
-         */
-        _ondragover: function (param) {
-            callChartListMethodReverse(this, 'ondragover', param);
-        },
-        
-        /**
-         * dragstart回调，可计算特性实现
-         */
-        _ondragleave: function (param) {
-            callChartListMethodReverse(this, 'ondragleave', param);
-        },
+    if (__DEV__) {
+        if (!seriesModel) {
+            console.warn('There is no specified seires model');
+        }
+    }
 
-        /**
-         * dragstart回调，可计算特性实现
-         */
-        _ondrop: function (param) {
-            callChartListMethodReverse(this, 'ondrop', param, this._status);
-            this._island.ondrop(param, this._status);
-        },
+    var data = seriesModel.getData();
 
-        /**
-         * dragdone回调 ，可计算特性实现
-         */
-        _ondragend: function (param) {
-            callChartListMethodReverse(this, 'ondragend', param, this._status);
+    var dataIndexInside = finder.hasOwnProperty('dataIndexInside')
+        ? finder.dataIndexInside
+        : finder.hasOwnProperty('dataIndex')
+        ? data.indexOfRawIndex(finder.dataIndex)
+        : null;
 
-            this._timeline && this._timeline.ondragend(param, this._status);
-            this._island.ondragend(param, this._status);
+    return dataIndexInside != null
+        ? data.getItemVisual(dataIndexInside, visualType)
+        : data.getVisual(visualType);
+};
 
-            // 发生过重计算
-            if (this._status.needRefresh) {
-                this._syncBackupData(this._option);
+/**
+ * Get view of corresponding component model
+ * @param  {module:echarts/model/Component} componentModel
+ * @return {module:echarts/view/Component}
+ */
+echartsProto.getViewOfComponentModel = function (componentModel) {
+    return this._componentsMap[componentModel.__viewId];
+};
 
-                var messageCenter = this._messageCenter;
-                messageCenter.dispatch(
-                    ecConfig.EVENT.DATA_CHANGED,
-                    param.event,
-                    this._eventPackage(param.target),
-                    this
-                );
-                messageCenter.dispatch(ecConfig.EVENT.REFRESH, null, null, this);
-            }
-        },
+/**
+ * Get view of corresponding series model
+ * @param  {module:echarts/model/Series} seriesModel
+ * @return {module:echarts/view/Chart}
+ */
+echartsProto.getViewOfSeriesModel = function (seriesModel) {
+    return this._chartsMap[seriesModel.__viewId];
+};
 
-        /**
-         * 图例选择响应
-         */
-        _onlegendSelected: function (param) {
-            // 用于图表间通信
-            this._status.needRefresh = false;
-            callChartListMethodReverse(this, 'onlegendSelected', param, this._status);
+var updateMethods = {
 
-            if (this._status.needRefresh) {
-                this._messageCenter.dispatch(ecConfig.EVENT.REFRESH, null, null, this);
-            }
-        },
+    prepareAndUpdate: function (payload) {
+        prepare(this);
+        updateMethods.update.call(this, payload);
+    },
 
-        /**
-         * 数据区域缩放响应 
-         */
-        _ondataZoom: function (param) {
-            // 用于图表间通信
-            this._status.needRefresh = false;
-            callChartListMethodReverse(this, 'ondataZoom', param, this._status);
+    /**
+     * @param {Object} payload
+     * @private
+     */
+    update: function (payload) {
+        // console.profile && console.profile('update');
 
-            if (this._status.needRefresh) {
-                this._messageCenter.dispatch(ecConfig.EVENT.REFRESH, null, null, this);
-            }
-        },
+        var ecModel = this._model;
+        var api = this._api;
+        var zr = this._zr;
+        var coordSysMgr = this._coordSysMgr;
+        var scheduler = this._scheduler;
 
-        /**
-         * 值域漫游响应 
-         */
-        _ondataRange: function (param) {
-            this._clearEffect();
-            // 用于图表间通信
-            this._status.needRefresh = false;
-            callChartListMethodReverse(this, 'ondataRange', param, this._status);
-            
-            // 没有相互影响，直接刷新即可
-            if (this._status.needRefresh) {
-                this._zr.refreshNextFrame();
-            }
-        },
-
-        /**
-         * 动态类型切换响应 
-         */
-        _onmagicTypeChanged: function () {
-            this._clearEffect();
-            this._render(this._toolbox.getMagicOption());
-        },
-
-        /**
-         * 数据视图修改响应 
-         */
-        _ondataViewChanged: function (param) {
-            this._syncBackupData(param.option);
-            this._messageCenter.dispatch(
-                ecConfig.EVENT.DATA_CHANGED,
-                null,
-                param,
-                this
-            );
-            this._messageCenter.dispatch(ecConfig.EVENT.REFRESH, null, null, this);
-        },
-        
-        /**
-         * tooltip与图表间通信 
-         */
-        _tooltipHover: function (param) {
-            var tipShape = [];
-            callChartListMethodReverse(this, 'ontooltipHover', param, tipShape);
-        },
-
-        /**
-         * 还原 
-         */
-        _onrestore: function () {
-            this.restore();
-        },
-
-        /**
-         * 刷新 
-         */
-        _onrefresh: function (param) {
-            this._refreshInside = true;
-            this.refresh(param);
-            this._refreshInside = false;
-        },
-        
-        /**
-         * 数据修改后的反向同步dataZoom持有的备份数据 
-         */
-        _syncBackupData: function (curOption) {
-            this.component.dataZoom && this.component.dataZoom.syncBackupData(curOption);
-        },
-
-        /**
-         * 打包Echarts层的事件附件
-         */
-        _eventPackage: function (target) {
-            if (target) {
-                var ecData = require('./util/ecData');
-                
-                var seriesIndex = ecData.get(target, 'seriesIndex');
-                var dataIndex = ecData.get(target, 'dataIndex');
-                
-                dataIndex = seriesIndex != -1 && this.component.dataZoom
-                            ? this.component.dataZoom.getRealDataIndex(
-                                seriesIndex,
-                                dataIndex
-                              )
-                            : dataIndex;
-                return {
-                    seriesIndex: seriesIndex,
-                    seriesName: (ecData.get(target, 'series') || {}).name,
-                    dataIndex: dataIndex,
-                    data: ecData.get(target, 'data'),
-                    name: ecData.get(target, 'name'),
-                    value: ecData.get(target, 'value'),
-                    special: ecData.get(target, 'special')
-                };
-            }
+        // update before setOption
+        if (!ecModel) {
             return;
-        },
+        }
 
-        _noDataCheck: function(magicOption) {
-            var series = magicOption.series;
-            for (var i = 0, l = series.length; i < l; i++) {
-                if (series[i].type == ecConfig.CHART_TYPE_MAP
-                    || (series[i].data && series[i].data.length > 0)
-                    || (series[i].markPoint && series[i].markPoint.data && series[i].markPoint.data.length > 0)
-                    || (series[i].markLine && series[i].markLine.data && series[i].markLine.data.length > 0)
-                    || (series[i].nodes && series[i].nodes.length > 0)
-                    || (series[i].links && series[i].links.length > 0)
-                    || (series[i].matrix && series[i].matrix.length > 0)
-                    || (series[i].eventList && series[i].eventList.length > 0)
-                ) {
-                    return false;   // 存在任意数据则为非空数据
-                }
+        scheduler.restoreData(ecModel, payload);
+
+        scheduler.performSeriesTasks(ecModel);
+
+        // TODO
+        // Save total ecModel here for undo/redo (after restoring data and before processing data).
+        // Undo (restoration of total ecModel) can be carried out in 'action' or outside API call.
+
+        // Create new coordinate system each update
+        // In LineView may save the old coordinate system and use it to get the orignal point
+        coordSysMgr.create(ecModel, api);
+
+        scheduler.performDataProcessorTasks(ecModel, payload);
+
+        // Current stream render is not supported in data process. So we can update
+        // stream modes after data processing, where the filtered data is used to
+        // deteming whether use progressive rendering.
+        updateStreamModes(this, ecModel);
+
+        // We update stream modes before coordinate system updated, then the modes info
+        // can be fetched when coord sys updating (consider the barGrid extent fix). But
+        // the drawback is the full coord info can not be fetched. Fortunately this full
+        // coord is not requied in stream mode updater currently.
+        coordSysMgr.update(ecModel, api);
+
+        clearColorPalette(ecModel);
+        scheduler.performVisualTasks(ecModel, payload);
+
+        render(this, ecModel, api, payload);
+
+        // Set background
+        var backgroundColor = ecModel.get('backgroundColor') || 'transparent';
+
+        // In IE8
+        if (!env.canvasSupported) {
+            var colorArr = colorTool.parse(backgroundColor);
+            backgroundColor = colorTool.stringify(colorArr, 'rgb');
+            if (colorArr[3] === 0) {
+                backgroundColor = 'transparent';
             }
-            // 空数据
-            this.clear();
-            var loadOption = this._themeConfig.noDataLoadingOption || {
-                text: this._themeConfig.noDataText,
-                effect: this._themeConfig.noDataEffect
-            };
-            this.showLoading(loadOption);
-            return true;
-        },
+        }
+        else {
+            zr.setBackgroundColor(backgroundColor);
+        }
 
-        /**
-         * 图表渲染 
-         */
-        _render: function (magicOption) {
-            this._mergeGlobalConifg(magicOption);
+        performPostUpdateFuncs(ecModel, api);
 
-            if (this._noDataCheck(magicOption)) {
-                return;
-            }
+        // console.profile && console.profileEnd('update');
+    },
 
-            var bgColor = magicOption.backgroundColor;
-            if (bgColor) {
-                if (!_canvasSupported 
-                    && bgColor.indexOf('rgba') != -1
-                ) {
-                    // IE6~8对RGBA的处理，filter会带来其他颜色的影响
-                    var cList = bgColor.split(',');
-                    this.dom.style.filter = 'alpha(opacity=' +
-                        cList[3].substring(0, cList[3].lastIndexOf(')')) * 100
-                        + ')';
-                    cList.length = 3;
-                    cList[0] = cList[0].replace('a', '');
-                    this.dom.style.backgroundColor = cList.join(',') + ')';
-                }
-                else {
-                    this.dom.style.backgroundColor = bgColor;
-                }
-            }
-            
-            this._zr.clearAnimation();
-            this._chartList = [];
+    /**
+     * @param {Object} payload
+     * @private
+     */
+    updateTransform: function (payload) {
+        var ecModel = this._model;
+        var ecIns = this;
+        var api = this._api;
 
-            var chartLibrary = require('./chart');
-            var componentLibrary = require('./component');
-            
-            if (magicOption.xAxis || magicOption.yAxis) {
-                magicOption.grid = magicOption.grid || {};
-                magicOption.dataZoom = magicOption.dataZoom || {};
-            }
-            
-            var componentList = [
-                'title', 'legend', 'tooltip', 'dataRange', 'roamController',
-                'grid', 'dataZoom', 'xAxis', 'yAxis', 'polar'
-            ];
-            
-            var ComponentClass;
-            var componentType;
-            var component;
-            for (var i = 0, l = componentList.length; i < l; i++) {
-                componentType = componentList[i];
-                component = this.component[componentType];
+        // update before setOption
+        if (!ecModel) {
+            return;
+        }
 
-                if (magicOption[componentType]) {
-                    if (component) {
-                        component.refresh && component.refresh(magicOption);
-                    }
-                    else {
-                        ComponentClass = componentLibrary.get(
-                            /^[xy]Axis$/.test(componentType) ? 'axis' : componentType
-                        );
-                        component = new ComponentClass(
-                            this._themeConfig, this._messageCenter, this._zr,
-                            magicOption, this, componentType
-                        );
-                        this.component[componentType] = component;
-                    }
-                    this._chartList.push(component);
-                }
-                else if (component) {
-                    component.dispose();
-                    this.component[componentType] = null;
-                    delete this.component[componentType];
-                }
-            }
+        // ChartView.markUpdateMethod(payload, 'updateTransform');
 
-            var ChartClass;
-            var chartType;
-            var chart;
-            var chartMap = {};      // 记录已经初始化的图表
-            for (var i = 0, l = magicOption.series.length; i < l; i++) {
-                chartType = magicOption.series[i].type;
-                if (!chartType) {
-                    console.error('series[' + i + '] chart type has not been defined.');
-                    continue;
-                }
-
-                if (!chartMap[chartType]) {
-                    chartMap[chartType] = true;
-                    ChartClass = chartLibrary.get(chartType);
-                    if (ChartClass) {
-                        if (this.chart[chartType]) {
-                            chart = this.chart[chartType];
-                            chart.refresh(magicOption);
-                        }
-                        else {
-                            chart = new ChartClass(
-                                this._themeConfig, this._messageCenter, this._zr,
-                                magicOption, this
-                            );
-                        }
-                        this._chartList.push(chart);
-                        this.chart[chartType] = chart;
-                    }
-                    else {
-                        console.error(chartType + ' has not been required.');
-                    }
-                }
-            }
-            
-            // 已有实例但新option不带这类图表的实例释放
-            for (chartType in this.chart) {
-                if (chartType != ecConfig.CHART_TYPE_ISLAND  && !chartMap[chartType]) {
-                    this.chart[chartType].dispose();
-                    this.chart[chartType] = null;
-                    delete this.chart[chartType];
-                }
-            }
-            
-            this.component.grid && this.component.grid.refixAxisShape(this.component);
-
-            this._island.refresh(magicOption);
-            this._toolbox.refresh(magicOption);
-            
-            magicOption.animation && !magicOption.renderAsImage
-                ? this._zr.refresh()
-                : this._zr.render();
-            
-            var imgId = 'IMG' + this.id;
-            var img = document.getElementById(imgId);
-            if (magicOption.renderAsImage && _canvasSupported) {
-                // IE8- 不支持图片渲染形式
-                if (img) {
-                    // 已经渲染过则更新显示
-                    img.src = this.getDataURL(magicOption.renderAsImage);
+        var componentDirtyList = [];
+        ecModel.eachComponent(function (componentType, componentModel) {
+            var componentView = ecIns.getViewOfComponentModel(componentModel);
+            if (componentView && componentView.__alive) {
+                if (componentView.updateTransform) {
+                    var result = componentView.updateTransform(componentModel, ecModel, api, payload);
+                    result && result.update && componentDirtyList.push(componentView);
                 }
                 else {
-                    // 没有渲染过插入img dom
-                    img = this.getImage(magicOption.renderAsImage);
-                    img.id = imgId;
-                    img.style.position = 'absolute';
-                    img.style.left = 0;
-                    img.style.top = 0;
-                    this.dom.firstChild.appendChild(img);
-                }
-                this.un();
-                this._zr.un();
-                this._disposeChartList();
-                this._zr.clear();
-            }
-            else if (img) {
-                // 删除可能存在的img
-                img.parentNode.removeChild(img);
-            }
-            img = null;
-            
-            this._option = magicOption;
-        },
-
-        /**
-         * 还原 
-         */
-        restore: function () {
-            this._clearEffect();
-            this._option = zrUtil.clone(this._optionRestore);
-            this._disposeChartList();
-            this._island.clear();
-            this._toolbox.reset(this._option, true);
-            this._render(this._option);
-        },
-
-        /**
-         * 刷新 
-         * @param {Object=} param，可选参数，用于附带option，内部同步用，外部不建议带入数据修改，无法同步 
-         */
-        refresh: function (param) {
-            this._clearEffect();
-            param = param || {};
-            var magicOption = param.option;
-            
-            // 外部调用的refresh且有option带入
-            if (!this._refreshInside && magicOption) {
-                // 做简单的差异合并去同步内部持有的数据克隆，不建议带入数据
-                // 开启数据区域缩放、拖拽重计算、数据视图可编辑模式情况下，当用户产生了数据变化后无法同步
-                // 如有带入option存在数据变化，请重新setOption
-                magicOption = this.getOption();
-                zrUtil.merge(magicOption, param.option, true);
-                zrUtil.merge(this._optionRestore, param.option, true);
-                this._toolbox.reset(magicOption);
-            }
-            
-            this._island.refresh(magicOption);
-            this._toolbox.refresh(magicOption);
-            
-            // 停止动画
-            this._zr.clearAnimation();
-            // 先来后到，安顺序刷新各种图表，图表内部refresh优化检查magicOption，无需更新则不更新~
-            for (var i = 0, l = this._chartList.length; i < l; i++) {
-                this._chartList[i].refresh && this._chartList[i].refresh(magicOption);
-            }
-            this.component.grid && this.component.grid.refixAxisShape(this.component);
-            this._zr.refresh();
-        },
-
-        /**
-         * 释放图表实例
-         */
-        _disposeChartList: function () {
-            this._clearEffect();
-
-            // 停止动画
-            this._zr.clearAnimation();
-
-            var len = this._chartList.length;
-            while (len--) {
-                var chart = this._chartList[len];
-
-                if (chart) {
-                    var chartType = chart.type;
-                    this.chart[chartType] && delete this.chart[chartType];
-                    this.component[chartType] && delete this.component[chartType];
-                    chart.dispose && chart.dispose();
+                    componentDirtyList.push(componentView);
                 }
             }
+        });
 
-            this._chartList = [];
-        },
-
-        /**
-         * 非图表全局属性merge~~ 
-         */
-        _mergeGlobalConifg: function (magicOption) {
-            var mergeList = [
-                // 背景颜色
-                'backgroundColor',
-                
-                // 拖拽重计算相关
-                'calculable', 'calculableColor', 'calculableHolderColor',
-                
-                // 孤岛显示连接符
-                'nameConnector', 'valueConnector',
-                
-                // 动画相关
-                'animation', 'animationThreshold',
-                'animationDuration', 'animationDurationUpdate',
-                'animationEasing', 'addDataAnimation',
-                
-                // 默认标志图形类型列表
-                'symbolList',
-                
-                // 降低图表内元素拖拽敏感度，单位ms，不建议外部干预
-                'DRAG_ENABLE_TIME'
-            ];
-
-            var len = mergeList.length;
-            while (len--) {
-                var mergeItem = mergeList[len];
-                if (magicOption[mergeItem] == null) {
-                    magicOption[mergeItem] = this._themeConfig[mergeItem];
-                }
-            }
-            
-            // 数值系列的颜色列表，不传则采用内置颜色，可配数组，借用zrender实例注入，会有冲突风险，先这样
-            var themeColor = magicOption.color;
-            if (!(themeColor && themeColor.length)) {
-                themeColor = this._themeConfig.color;
-            }
-            
-            this._zr.getColor = function (idx) {
-                var zrColor = require('zrender/tool/color');
-                return zrColor.getColor(idx, themeColor);
-            };
-            
-            if (!_canvasSupported) {
-                // 不支持Canvas的强制关闭动画
-                magicOption.animation = false;
-                magicOption.addDataAnimation = false;
-            }
-        },
-        
-        /**
-         * 万能接口，配置图表实例任何可配置选项，多次调用时option选项做merge处理
-         * @param {Object} option
-         * @param {boolean=} notMerge 多次调用时option选项是默认是合并（merge）的，
-         *                   如果不需求，可以通过notMerger参数为true阻止与上次option的合并
-         */
-        setOption: function (option, notMerge) {
-            if (!option.timeline) {
-                return this._setOption(option, notMerge);
+        var seriesDirtyMap = zrUtil.createHashMap();
+        ecModel.eachSeries(function (seriesModel) {
+            var chartView = ecIns._chartsMap[seriesModel.__viewId];
+            if (chartView.updateTransform) {
+                var result = chartView.updateTransform(seriesModel, ecModel, api, payload);
+                result && result.update && seriesDirtyMap.set(seriesModel.uid, 1);
             }
             else {
-                return this._setTimelineOption(option);
+                seriesDirtyMap.set(seriesModel.uid, 1);
             }
-        },
-        
-        /**
-         * 万能接口，配置图表实例任何可配置选项，多次调用时option选项做merge处理
-         * @param {Object} option
-         * @param {boolean=} notMerge 多次调用时option选项是默认是合并（merge）的，
-         *                   如果不需求，可以通过notMerger参数为true阻止与上次option的合并
-         */
-        _setOption: function (option, notMerge) {
-            if (!notMerge && this._option) {
-                this._option = zrUtil.merge(
-                    this.getOption(),
-                    zrUtil.clone(option),
-                    true
-                );
-            }
-            else {
-                this._option = zrUtil.clone(option);
+        });
+
+        clearColorPalette(ecModel);
+        // Keep pipe to the exist pipeline because it depends on the render task of the full pipeline.
+        // this._scheduler.performVisualTasks(ecModel, payload, 'layout', true);
+        this._scheduler.performVisualTasks(
+            ecModel, payload, {setDirty: true, dirtyMap: seriesDirtyMap}
+        );
+
+        // Currently, not call render of components. Geo render cost a lot.
+        // renderComponents(ecIns, ecModel, api, payload, componentDirtyList);
+        renderSeries(ecIns, ecModel, api, payload, seriesDirtyMap);
+
+        performPostUpdateFuncs(ecModel, this._api);
+    },
+
+    /**
+     * @param {Object} payload
+     * @private
+     */
+    updateView: function (payload) {
+        var ecModel = this._model;
+
+        // update before setOption
+        if (!ecModel) {
+            return;
+        }
+
+        ChartView.markUpdateMethod(payload, 'updateView');
+
+        clearColorPalette(ecModel);
+
+        // Keep pipe to the exist pipeline because it depends on the render task of the full pipeline.
+        this._scheduler.performVisualTasks(ecModel, payload, {setDirty: true});
+
+        render(this, this._model, this._api, payload);
+
+        performPostUpdateFuncs(ecModel, this._api);
+    },
+
+    /**
+     * @param {Object} payload
+     * @private
+     */
+    updateVisual: function (payload) {
+        updateMethods.update.call(this, payload);
+
+        // var ecModel = this._model;
+
+        // // update before setOption
+        // if (!ecModel) {
+        //     return;
+        // }
+
+        // ChartView.markUpdateMethod(payload, 'updateVisual');
+
+        // clearColorPalette(ecModel);
+
+        // // Keep pipe to the exist pipeline because it depends on the render task of the full pipeline.
+        // this._scheduler.performVisualTasks(ecModel, payload, {visualType: 'visual', setDirty: true});
+
+        // render(this, this._model, this._api, payload);
+
+        // performPostUpdateFuncs(ecModel, this._api);
+    },
+
+    /**
+     * @param {Object} payload
+     * @private
+     */
+    updateLayout: function (payload) {
+        updateMethods.update.call(this, payload);
+
+        // var ecModel = this._model;
+
+        // // update before setOption
+        // if (!ecModel) {
+        //     return;
+        // }
+
+        // ChartView.markUpdateMethod(payload, 'updateLayout');
+
+        // // Keep pipe to the exist pipeline because it depends on the render task of the full pipeline.
+        // // this._scheduler.performVisualTasks(ecModel, payload, 'layout', true);
+        // this._scheduler.performVisualTasks(ecModel, payload, {setDirty: true});
+
+        // render(this, this._model, this._api, payload);
+
+        // performPostUpdateFuncs(ecModel, this._api);
+    }
+};
+
+function prepare(ecIns) {
+    var ecModel = ecIns._model;
+    var scheduler = ecIns._scheduler;
+
+    scheduler.restorePipelines(ecModel);
+
+    scheduler.prepareStageTasks();
+
+    prepareView(ecIns, 'component', ecModel, scheduler);
+
+    prepareView(ecIns, 'chart', ecModel, scheduler);
+
+    scheduler.plan();
+}
+
+/**
+ * @private
+ */
+function updateDirectly(ecIns, method, payload, mainType, subType) {
+    var ecModel = ecIns._model;
+
+    // broadcast
+    if (!mainType) {
+        // FIXME
+        // Chart will not be update directly here, except set dirty.
+        // But there is no such scenario now.
+        each(ecIns._componentsViews.concat(ecIns._chartsViews), callView);
+        return;
+    }
+
+    var query = {};
+    query[mainType + 'Id'] = payload[mainType + 'Id'];
+    query[mainType + 'Index'] = payload[mainType + 'Index'];
+    query[mainType + 'Name'] = payload[mainType + 'Name'];
+
+    var condition = {mainType: mainType, query: query};
+    subType && (condition.subType = subType); // subType may be '' by parseClassType;
+
+    var excludeSeriesId = payload.excludeSeriesId;
+    if (excludeSeriesId != null) {
+        excludeSeriesId = zrUtil.createHashMap(modelUtil.normalizeToArray(excludeSeriesId));
+    }
+
+    // If dispatchAction before setOption, do nothing.
+    ecModel && ecModel.eachComponent(condition, function (model) {
+        if (!excludeSeriesId || excludeSeriesId.get(model.id) == null) {
+            callView(ecIns[
+                mainType === 'series' ? '_chartsMap' : '_componentsMap'
+            ][model.__viewId]);
+        }
+    }, ecIns);
+
+    function callView(view) {
+        view && view.__alive && view[method] && view[method](
+            view.__model, ecModel, ecIns._api, payload
+        );
+    }
+}
+
+/**
+ * Resize the chart
+ * @param {Object} opts
+ * @param {number} [opts.width] Can be 'auto' (the same as null/undefined)
+ * @param {number} [opts.height] Can be 'auto' (the same as null/undefined)
+ * @param {boolean} [opts.silent=false]
+ */
+echartsProto.resize = function (opts) {
+    if (__DEV__) {
+        assert(!this[IN_MAIN_PROCESS], '`resize` should not be called during main process.');
+    }
+
+    this._zr.resize(opts);
+
+    var ecModel = this._model;
+
+    // Resize loading effect
+    this._loadingFX && this._loadingFX.resize();
+
+    if (!ecModel) {
+        return;
+    }
+
+    var optionChanged = ecModel.resetOption('media');
+
+    var silent = opts && opts.silent;
+
+    this[IN_MAIN_PROCESS] = true;
+
+    optionChanged && prepare(this);
+    updateMethods.update.call(this);
+
+    this[IN_MAIN_PROCESS] = false;
+
+    flushPendingActions.call(this, silent);
+
+    triggerUpdatedEvent.call(this, silent);
+};
+
+function updateStreamModes(ecIns, ecModel) {
+    var chartsMap = ecIns._chartsMap;
+    var scheduler = ecIns._scheduler;
+    ecModel.eachSeries(function (seriesModel) {
+        scheduler.updateStreamModes(seriesModel, chartsMap[seriesModel.__viewId]);
+    });
+}
+
+/**
+ * Show loading effect
+ * @param  {string} [name='default']
+ * @param  {Object} [cfg]
+ */
+echartsProto.showLoading = function (name, cfg) {
+    if (isObject(name)) {
+        cfg = name;
+        name = '';
+    }
+    name = name || 'default';
+
+    this.hideLoading();
+    if (!loadingEffects[name]) {
+        if (__DEV__) {
+            console.warn('Loading effects ' + name + ' not exists.');
+        }
+        return;
+    }
+    var el = loadingEffects[name](this._api, cfg);
+    var zr = this._zr;
+    this._loadingFX = el;
+
+    zr.add(el);
+};
+
+/**
+ * Hide loading effect
+ */
+echartsProto.hideLoading = function () {
+    this._loadingFX && this._zr.remove(this._loadingFX);
+    this._loadingFX = null;
+};
+
+/**
+ * @param {Object} eventObj
+ * @return {Object}
+ */
+echartsProto.makeActionFromEvent = function (eventObj) {
+    var payload = zrUtil.extend({}, eventObj);
+    payload.type = eventActionMap[eventObj.type];
+    return payload;
+};
+
+/**
+ * @pubilc
+ * @param {Object} payload
+ * @param {string} [payload.type] Action type
+ * @param {Object|boolean} [opt] If pass boolean, means opt.silent
+ * @param {boolean} [opt.silent=false] Whether trigger events.
+ * @param {boolean} [opt.flush=undefined]
+ *                  true: Flush immediately, and then pixel in canvas can be fetched
+ *                      immediately. Caution: it might affect performance.
+ *                  false: Not not flush.
+ *                  undefined: Auto decide whether perform flush.
+ */
+echartsProto.dispatchAction = function (payload, opt) {
+    if (!isObject(opt)) {
+        opt = {silent: !!opt};
+    }
+
+    if (!actions[payload.type]) {
+        return;
+    }
+
+    // Avoid dispatch action before setOption. Especially in `connect`.
+    if (!this._model) {
+        return;
+    }
+
+    // May dispatchAction in rendering procedure
+    if (this[IN_MAIN_PROCESS]) {
+        this._pendingActions.push(payload);
+        return;
+    }
+
+    doDispatchAction.call(this, payload, opt.silent);
+
+    if (opt.flush) {
+        this._zr.flush(true);
+    }
+    else if (opt.flush !== false && env.browser.weChat) {
+        // In WeChat embeded browser, `requestAnimationFrame` and `setInterval`
+        // hang when sliding page (on touch event), which cause that zr does not
+        // refresh util user interaction finished, which is not expected.
+        // But `dispatchAction` may be called too frequently when pan on touch
+        // screen, which impacts performance if do not throttle them.
+        this._throttledZrFlush();
+    }
+
+    flushPendingActions.call(this, opt.silent);
+
+    triggerUpdatedEvent.call(this, opt.silent);
+};
+
+function doDispatchAction(payload, silent) {
+    var payloadType = payload.type;
+    var escapeConnect = payload.escapeConnect;
+    var actionWrap = actions[payloadType];
+    var actionInfo = actionWrap.actionInfo;
+
+    var cptType = (actionInfo.update || 'update').split(':');
+    var updateMethod = cptType.pop();
+    cptType = cptType[0] != null && parseClassType(cptType[0]);
+
+    this[IN_MAIN_PROCESS] = true;
+
+    var payloads = [payload];
+    var batched = false;
+    // Batch action
+    if (payload.batch) {
+        batched = true;
+        payloads = zrUtil.map(payload.batch, function (item) {
+            item = zrUtil.defaults(zrUtil.extend({}, item), payload);
+            item.batch = null;
+            return item;
+        });
+    }
+
+    var eventObjBatch = [];
+    var eventObj;
+    var isHighDown = payloadType === 'highlight' || payloadType === 'downplay';
+
+    each(payloads, function (batchItem) {
+        // Action can specify the event by return it.
+        eventObj = actionWrap.action(batchItem, this._model, this._api);
+        // Emit event outside
+        eventObj = eventObj || zrUtil.extend({}, batchItem);
+        // Convert type to eventType
+        eventObj.type = actionInfo.event || eventObj.type;
+        eventObjBatch.push(eventObj);
+
+        // light update does not perform data process, layout and visual.
+        if (isHighDown) {
+            // method, payload, mainType, subType
+            updateDirectly(this, updateMethod, batchItem, 'series');
+        }
+        else if (cptType) {
+            updateDirectly(this, updateMethod, batchItem, cptType.main, cptType.sub);
+        }
+    }, this);
+
+    if (updateMethod !== 'none' && !isHighDown && !cptType) {
+        // Still dirty
+        if (this[OPTION_UPDATED]) {
+            // FIXME Pass payload ?
+            prepare(this);
+            updateMethods.update.call(this, payload);
+            this[OPTION_UPDATED] = false;
+        }
+        else {
+            updateMethods[updateMethod].call(this, payload);
+        }
+    }
+
+    // Follow the rule of action batch
+    if (batched) {
+        eventObj = {
+            type: actionInfo.event || payloadType,
+            escapeConnect: escapeConnect,
+            batch: eventObjBatch
+        };
+    }
+    else {
+        eventObj = eventObjBatch[0];
+    }
+
+    this[IN_MAIN_PROCESS] = false;
+
+    !silent && this._messageCenter.trigger(eventObj.type, eventObj);
+}
+
+function flushPendingActions(silent) {
+    var pendingActions = this._pendingActions;
+    while (pendingActions.length) {
+        var payload = pendingActions.shift();
+        doDispatchAction.call(this, payload, silent);
+    }
+}
+
+function triggerUpdatedEvent(silent) {
+    !silent && this.trigger('updated');
+}
+
+/**
+ * Event `rendered` is triggered when zr
+ * rendered. It is useful for realtime
+ * snapshot (reflect animation).
+ *
+ * Event `finished` is triggered when:
+ * (1) zrender rendering finished.
+ * (2) initial animation finished.
+ * (3) progressive rendering finished.
+ * (4) no pending action.
+ * (5) no delayed setOption needs to be processed.
+ */
+function bindRenderedEvent(zr, ecIns) {
+    zr.on('rendered', function () {
+
+        ecIns.trigger('rendered');
+
+        // The `finished` event should not be triggered repeatly,
+        // so it should only be triggered when rendering indeed happend
+        // in zrender. (Consider the case that dipatchAction is keep
+        // triggering when mouse move).
+        if (
+            // Although zr is dirty if initial animation is not finished
+            // and this checking is called on frame, we also check
+            // animation finished for robustness.
+            zr.animation.isFinished()
+            && !ecIns[OPTION_UPDATED]
+            && !ecIns._scheduler.unfinished
+            && !ecIns._pendingActions.length
+        ) {
+            ecIns.trigger('finished');
+        }
+    });
+}
+
+/**
+ * @param {Object} params
+ * @param {number} params.seriesIndex
+ * @param {Array|TypedArray} params.data
+ */
+echartsProto.appendData = function (params) {
+    var seriesIndex = params.seriesIndex;
+    var ecModel = this.getModel();
+    var seriesModel = ecModel.getSeriesByIndex(seriesIndex);
+
+    if (__DEV__) {
+        assert(params.data && seriesModel);
+    }
+
+    seriesModel.appendData(params);
+
+    // Note: `appendData` does not support that update extent of coordinate
+    // system, util some scenario require that. In the expected usage of
+    // `appendData`, the initial extent of coordinate system should better
+    // be fixed by axis `min`/`max` setting or initial data, otherwise if
+    // the extent changed while `appendData`, the location of the painted
+    // graphic elements have to be changed, which make the usage of
+    // `appendData` meaningless.
+
+    this._scheduler.unfinished = true;
+};
+
+/**
+ * Register event
+ * @method
+ */
+echartsProto.on = createRegisterEventWithLowercaseName('on');
+echartsProto.off = createRegisterEventWithLowercaseName('off');
+echartsProto.one = createRegisterEventWithLowercaseName('one');
+
+/**
+ * Prepare view instances of charts and components
+ * @param  {module:echarts/model/Global} ecModel
+ * @private
+ */
+function prepareView(ecIns, type, ecModel, scheduler) {
+    var isComponent = type === 'component';
+    var viewList = isComponent ? ecIns._componentsViews : ecIns._chartsViews;
+    var viewMap = isComponent ? ecIns._componentsMap : ecIns._chartsMap;
+    var zr = ecIns._zr;
+    var api = ecIns._api;
+
+    for (var i = 0; i < viewList.length; i++) {
+        viewList[i].__alive = false;
+    }
+
+    isComponent
+        ? ecModel.eachComponent(function (componentType, model) {
+            componentType !== 'series' && doPrepare(model);
+        })
+        : ecModel.eachSeries(doPrepare);
+
+    function doPrepare(model) {
+        // Consider: id same and type changed.
+        var viewId = '_ec_' + model.id + '_' + model.type;
+        var view = viewMap[viewId];
+        if (!view) {
+            var classType = parseClassType(model.type);
+            var Clazz = isComponent
+                ? ComponentView.getClass(classType.main, classType.sub)
+                : ChartView.getClass(classType.sub);
+
+            if (__DEV__) {
+                assert(Clazz, classType.sub + ' does not exist.');
             }
 
-            this._optionRestore = zrUtil.clone(this._option);
-            
-            if (!this._option.series || this._option.series.length === 0) {
-                this._zr.clear();
-                return;
+            view = new Clazz();
+            view.init(ecModel, api);
+            viewMap[viewId] = view;
+            viewList.push(view);
+            zr.add(view.group);
+        }
+
+        model.__viewId = view.__id = viewId;
+        view.__alive = true;
+        view.__model = model;
+        view.group.__ecComponentInfo = {
+            mainType: model.mainType,
+            index: model.componentIndex
+        };
+        !isComponent && scheduler.prepareView(view, model, ecModel, api);
+    }
+
+    for (var i = 0; i < viewList.length;) {
+        var view = viewList[i];
+        if (!view.__alive) {
+            !isComponent && view.renderTask.dispose();
+            zr.remove(view.group);
+            view.dispose(ecModel, api);
+            viewList.splice(i, 1);
+            delete viewMap[view.__id];
+            view.__id = view.group.__ecComponentInfo = null;
+        }
+        else {
+            i++;
+        }
+    }
+}
+
+// /**
+//  * Encode visual infomation from data after data processing
+//  *
+//  * @param {module:echarts/model/Global} ecModel
+//  * @param {object} layout
+//  * @param {boolean} [layoutFilter] `true`: only layout,
+//  *                                 `false`: only not layout,
+//  *                                 `null`/`undefined`: all.
+//  * @param {string} taskBaseTag
+//  * @private
+//  */
+// function startVisualEncoding(ecIns, ecModel, api, payload, layoutFilter) {
+//     each(visualFuncs, function (visual, index) {
+//         var isLayout = visual.isLayout;
+//         if (layoutFilter == null
+//             || (layoutFilter === false && !isLayout)
+//             || (layoutFilter === true && isLayout)
+//         ) {
+//             visual.func(ecModel, api, payload);
+//         }
+//     });
+// }
+
+function clearColorPalette(ecModel) {
+    ecModel.clearColorPalette();
+    ecModel.eachSeries(function (seriesModel) {
+        seriesModel.clearColorPalette();
+    });
+}
+
+function render(ecIns, ecModel, api, payload) {
+
+    renderComponents(ecIns, ecModel, api, payload);
+
+    each(ecIns._chartsViews, function (chart) {
+        chart.__alive = false;
+    });
+
+    renderSeries(ecIns, ecModel, api, payload);
+
+    // Remove groups of unrendered charts
+    each(ecIns._chartsViews, function (chart) {
+        if (!chart.__alive) {
+            chart.remove(ecModel, api);
+        }
+    });
+}
+
+function renderComponents(ecIns, ecModel, api, payload, dirtyList) {
+    each(dirtyList || ecIns._componentsViews, function (componentView) {
+        var componentModel = componentView.__model;
+        componentView.render(componentModel, ecModel, api, payload);
+
+        updateZ(componentModel, componentView);
+    });
+}
+
+/**
+ * Render each chart and component
+ * @private
+ */
+function renderSeries(ecIns, ecModel, api, payload, dirtyMap) {
+    // Render all charts
+    var scheduler = ecIns._scheduler;
+    var unfinished;
+    ecModel.eachSeries(function (seriesModel) {
+        var chartView = ecIns._chartsMap[seriesModel.__viewId];
+        chartView.__alive = true;
+
+        var renderTask = chartView.renderTask;
+        scheduler.updatePayload(renderTask, payload);
+
+        if (dirtyMap && dirtyMap.get(seriesModel.uid)) {
+            renderTask.dirty();
+        }
+
+        unfinished |= renderTask.perform(scheduler.getPerformArgs(renderTask));
+
+        chartView.group.silent = !!seriesModel.get('silent');
+
+        updateZ(seriesModel, chartView);
+
+        updateBlend(seriesModel, chartView);
+    });
+    scheduler.unfinished |= unfinished;
+
+    // If use hover layer
+    updateHoverLayerStatus(ecIns._zr, ecModel);
+
+    // Add aria
+    aria(ecIns._zr.dom, ecModel);
+}
+
+function performPostUpdateFuncs(ecModel, api) {
+    each(postUpdateFuncs, function (func) {
+        func(ecModel, api);
+    });
+}
+
+
+var MOUSE_EVENT_NAMES = [
+    'click', 'dblclick', 'mouseover', 'mouseout', 'mousemove',
+    'mousedown', 'mouseup', 'globalout', 'contextmenu'
+];
+
+/**
+ * @private
+ */
+echartsProto._initEvents = function () {
+    each(MOUSE_EVENT_NAMES, function (eveName) {
+        this._zr.on(eveName, function (e) {
+            var ecModel = this.getModel();
+            var el = e.target;
+            var params;
+            var isGlobalOut = eveName === 'globalout';
+
+            // no e.target when 'globalout'.
+            if (isGlobalOut) {
+                params = {};
+            }
+            else if (el && el.dataIndex != null) {
+                var dataModel = el.dataModel || ecModel.getSeriesByIndex(el.seriesIndex);
+                params = dataModel && dataModel.getDataParams(el.dataIndex, el.dataType) || {};
+            }
+            // If element has custom eventData of components
+            else if (el && el.eventData) {
+                params = zrUtil.extend({}, el.eventData);
             }
 
-            if (this.component.dataZoom                         // 存在dataZoom控件
-                && (this._option.dataZoom                       // 并且新option也存在
-                    || (this._option.toolbox
-                        && this._option.toolbox.feature
-                        && this._option.toolbox.feature.dataZoom
-                        && this._option.toolbox.feature.dataZoom.show
-                    )
-                )
-            ) {
-                // dataZoom同步数据
-                this.component.dataZoom.syncOption(this._option);
-            }
-            this._toolbox.reset(this._option);
-            this._render(this._option);
-            return this;
-        },
+            if (params) {
+                var componentType = params.componentType;
+                var componentIndex = params[componentType + 'Index'];
+                var model = componentType && componentIndex != null
+                    && ecModel.getComponent(componentType, componentIndex);
+                var view = model && this[
+                    model.mainType === 'series' ? '_chartsMap' : '_componentsMap'
+                ][model.__viewId];
 
-        /**
-         * 返回内部持有的当前显示option克隆 
-         */
-        getOption: function () {
-            var magicOption = zrUtil.clone(this._option);
-            
-            var self = this;
-            function restoreOption(prop) {
-                var restoreSource = self._optionRestore[prop];
-
-                if (restoreSource) {
-                    if (restoreSource instanceof Array) {
-                        var len = restoreSource.length;
-                        while (len--) {
-                            magicOption[prop][len].data = zrUtil.clone(
-                                restoreSource[len].data
-                            );
-                        }
-                    }
-                    else {
-                        magicOption[prop].data = zrUtil.clone(restoreSource.data);
-                    }
+                if (__DEV__) {
+                    // `event.componentType` and `event[componentTpype + 'Index']` must not
+                    // be missed, otherwise there is no way to distinguish source component.
+                    // See `dataFormat.getDataParams`.
+                    zrUtil.assert(isGlobalOut || (model && view));
                 }
+
+                params.event = e;
+                params.type = eveName;
+
+                var ecEventProcessor = this._ecEventProcessor;
+                ecEventProcessor.targetEl = el;
+                ecEventProcessor.packedEvent = params;
+                ecEventProcessor.model = model;
+                ecEventProcessor.view = view;
+
+                this.trigger(eveName, params);
             }
 
-            // 横轴数据还原
-            restoreOption('xAxis');
-            
-            // 纵轴数据还原
-            restoreOption('yAxis');
-            
-            // 系列数据还原
-            restoreOption('series');
-            
-            return magicOption;
-        },
+        }, this);
+    }, this);
 
-        /**
-         * 数据设置快捷接口
-         * @param {Array} series
-         * @param {boolean=} notMerge 多次调用时option选项是默认是合并（merge）的，
-         *                   如果不需求，可以通过notMerger参数为true阻止与上次option的合并。
-         */
-        setSeries: function (series, notMerge) {
-            if (!notMerge) {
-                this.setOption({series: series});
+    each(eventActionMap, function (actionType, eventType) {
+        this._messageCenter.on(eventType, function (event) {
+            this.trigger(eventType, event);
+        }, this);
+    }, this);
+};
+
+/**
+ * @return {boolean}
+ */
+echartsProto.isDisposed = function () {
+    return this._disposed;
+};
+
+/**
+ * Clear
+ */
+echartsProto.clear = function () {
+    this.setOption({ series: [] }, true);
+};
+
+/**
+ * Dispose instance
+ */
+echartsProto.dispose = function () {
+    if (this._disposed) {
+        if (__DEV__) {
+            console.warn('Instance ' + this.id + ' has been disposed');
+        }
+        return;
+    }
+    this._disposed = true;
+
+    modelUtil.setAttribute(this.getDom(), DOM_ATTRIBUTE_KEY, '');
+
+    var api = this._api;
+    var ecModel = this._model;
+
+    each(this._componentsViews, function (component) {
+        component.dispose(ecModel, api);
+    });
+    each(this._chartsViews, function (chart) {
+        chart.dispose(ecModel, api);
+    });
+
+    // Dispose after all views disposed
+    this._zr.dispose();
+
+    delete instances[this.id];
+};
+
+zrUtil.mixin(ECharts, Eventful);
+
+function updateHoverLayerStatus(zr, ecModel) {
+    var storage = zr.storage;
+    var elCount = 0;
+    storage.traverse(function (el) {
+        if (!el.isGroup) {
+            elCount++;
+        }
+    });
+    if (elCount > ecModel.get('hoverLayerThreshold') && !env.node) {
+        storage.traverse(function (el) {
+            if (!el.isGroup) {
+                // Don't switch back.
+                el.useHoverLayer = true;
             }
+        });
+    }
+}
+
+/**
+ * Update chart progressive and blend.
+ * @param {module:echarts/model/Series|module:echarts/model/Component} model
+ * @param {module:echarts/view/Component|module:echarts/view/Chart} view
+ */
+function updateBlend(seriesModel, chartView) {
+    var blendMode = seriesModel.get('blendMode') || null;
+    if (__DEV__) {
+        if (!env.canvasSupported && blendMode && blendMode !== 'source-over') {
+            console.warn('Only canvas support blendMode');
+        }
+    }
+    chartView.group.traverse(function (el) {
+        // FIXME marker and other components
+        if (!el.isGroup) {
+            // Only set if blendMode is changed. In case element is incremental and don't wan't to rerender.
+            if (el.style.blend !== blendMode) {
+                el.setStyle('blend', blendMode);
+            }
+        }
+        if (el.eachPendingDisplayable) {
+            el.eachPendingDisplayable(function (displayable) {
+                displayable.setStyle('blend', blendMode);
+            });
+        }
+    });
+}
+
+/**
+ * @param {module:echarts/model/Series|module:echarts/model/Component} model
+ * @param {module:echarts/view/Component|module:echarts/view/Chart} view
+ */
+function updateZ(model, view) {
+    var z = model.get('z');
+    var zlevel = model.get('zlevel');
+    // Set z and zlevel
+    view.group.traverse(function (el) {
+        if (el.type !== 'group') {
+            z != null && (el.z = z);
+            zlevel != null && (el.zlevel = zlevel);
+        }
+    });
+}
+
+function createExtensionAPI(ecInstance) {
+    var coordSysMgr = ecInstance._coordSysMgr;
+    return zrUtil.extend(new ExtensionAPI(ecInstance), {
+        // Inject methods
+        getCoordinateSystems: zrUtil.bind(
+            coordSysMgr.getCoordinateSystems, coordSysMgr
+        ),
+        getComponentByElement: function (el) {
+            while (el) {
+                var modelInfo = el.__ecComponentInfo;
+                if (modelInfo != null) {
+                    return ecInstance._model.getComponent(modelInfo.mainType, modelInfo.index);
+                }
+                el = el.parent;
+            }
+        }
+    });
+}
+
+/**
+ * Usage of query:
+ * `chart.on('click', query, handler);`
+ * The `query` can be:
+ * + The component type query string, only `mainType` or `mainType.subType`,
+ *   like: 'xAxis', 'series', 'xAxis.category' or 'series.line'.
+ * + The component query object, like:
+ *   `{seriesIndex: 2}`, `{seriesName: 'xx'}`, `{seriesId: 'some'}`,
+ *   `{xAxisIndex: 2}`, `{xAxisName: 'xx'}`, `{xAxisId: 'some'}`.
+ * + The element query object, like:
+ *   `{targetName: 'some'}` (only available in custom series).
+ *
+ * Caveat: If a prop in the `query` object is `null/undefined`, it is the
+ * same as there is no such prop in the `query` object.
+ */
+function makeEventProcessor(ecIns) {
+    return {
+
+        normalizeQuery: function (query) {
+            var cptQuery = {};
+            var dataQuery = {};
+            var otherQuery = {};
+
+            // `query` is `mainType` or `mainType.subType` of component.
+            if (zrUtil.isString(query)) {
+                var condCptType = parseClassType(query);
+                // `.main` and `.sub` may be ''.
+                cptQuery.mainType = condCptType.main || null;
+                cptQuery.subType = condCptType.sub || null;
+            }
+            // `query` is an object, convert to {mainType, index, name, id}.
             else {
-                this._option.series = series;
-                this.setOption(this._option, notMerge);
-            }
-            return this;
-        },
-
-        /**
-         * 返回内部持有的当前显示series克隆 
-         */
-        getSeries: function () {
-            return this.getOption().series;
-        },
-        
-        /**
-         * timelineOption接口，配置图表实例任何可配置选项
-         * @param {Object} option
-         */
-        _setTimelineOption: function(option) {
-            this._timeline && this._timeline.dispose();
-            var Timeline = require('./component/timeline');
-            var timeline = new Timeline(
-                this._themeConfig, this._messageCenter, this._zr, option, this
-            );
-            this._timeline = timeline;
-            this.component.timeline = this._timeline;
-            
-            return this;
-        },
-        
-        /**
-         * 动态数据添加
-         * 形参为单组数据参数，多组时为数据，内容同[seriesIdx, data, isShift, additionData]
-         * @param {number} seriesIdx 系列索引
-         * @param {number | Object} data 增加数据
-         * @param {boolean=} isHead 是否队头加入，默认，不指定或false时为队尾插入
-         * @param {boolean=} dataGrow 是否增长数据队列长度，默认，不指定或false时移出目标数组对位数据
-         * @param {string=} additionData 是否增加类目轴(饼图为图例)数据，附加操作同isHead和dataGrow
-         */
-        addData: function (seriesIdx, data, isHead, dataGrow, additionData) {
-            var params = seriesIdx instanceof Array
-                ? seriesIdx
-                : [[seriesIdx, data, isHead, dataGrow, additionData]];
-
-            //this._optionRestore 和 magicOption 都要同步
-            var magicOption = this.getOption();
-            var optionRestore = this._optionRestore;
-            for (var i = 0, l = params.length; i < l; i++) {
-                seriesIdx = params[i][0];
-                data = params[i][1];
-                isHead = params[i][2];
-                dataGrow = params[i][3];
-                additionData = params[i][4];
-
-                
-                var seriesItem = optionRestore.series[seriesIdx];
-                var inMethod = isHead ? 'unshift' : 'push';
-                var outMethod = isHead ? 'pop' : 'shift';
-                if (seriesItem) {
-                    var seriesItemData = seriesItem.data;
-                    var mSeriesItemData = magicOption.series[seriesIdx].data;
-
-                    seriesItemData[inMethod](data);
-                    mSeriesItemData[inMethod](data);
-                    if (!dataGrow) {
-                        seriesItemData[outMethod]();
-                        data = mSeriesItemData[outMethod]();
-                    }
-                    
-                    
-                    if (additionData != null) {
-                        var legend;
-                        var legendData;
-
-                        if (seriesItem.type === ecConfig.CHART_TYPE_PIE
-                            && (legend = optionRestore.legend) 
-                            && (legendData = legend.data)
-                        ) {
-                            var mLegendData = magicOption.legend.data;
-                            legendData[inMethod](additionData);
-                            mLegendData[inMethod](additionData);
-
-                            if (!dataGrow) {
-                                var legendDataIdx = zrUtil.indexOf(legendData, data.name);
-                                legendDataIdx != -1 && legendData.splice(legendDataIdx, 1);
-                                
-                                legendDataIdx = zrUtil.indexOf(mLegendData, data.name);
-                                legendDataIdx != -1 && mLegendData.splice(legendDataIdx, 1);
+                // `xxxIndex`, `xxxName`, `xxxId`, `name`, `dataIndex`, `dataType` is reserved,
+                // can not be used in `compomentModel.filterForExposedEvent`.
+                var suffixes = ['Index', 'Name', 'Id'];
+                var dataKeys = {name: 1, dataIndex: 1, dataType: 1};
+                zrUtil.each(query, function (val, key) {
+                    var reserved;
+                    for (var i = 0; i < suffixes.length; i++) {
+                        var propSuffix = suffixes[i];
+                        var suffixPos = key.lastIndexOf(propSuffix);
+                        if (suffixPos > 0 && suffixPos === key.length - propSuffix.length) {
+                            var mainType = key.slice(0, suffixPos);
+                            // Consider `dataIndex`.
+                            if (mainType !== 'data') {
+                                cptQuery.mainType = mainType;
+                                cptQuery[propSuffix.toLowerCase()] = val;
+                                reserved = true;
                             }
                         }
-                        else if (optionRestore.xAxis != null && optionRestore.yAxis != null) {
-                            // x轴类目
-                            var axisData;
-                            var mAxisData;
-                            var axisIdx = seriesItem.xAxisIndex || 0;
-
-                            if (optionRestore.xAxis[axisIdx].type == null
-                                || optionRestore.xAxis[axisIdx].type === 'category'
-                            ) {
-                                axisData = optionRestore.xAxis[axisIdx].data;
-                                mAxisData = magicOption.xAxis[axisIdx].data;
-
-                                axisData[inMethod](additionData);
-                                mAxisData[inMethod](additionData);
-                                if (!dataGrow) {
-                                    axisData[outMethod]();
-                                    mAxisData[outMethod]();
-                                }
-                            }
-                            
-                            // y轴类目
-                            axisIdx = seriesItem.yAxisIndex || 0;
-                            if (optionRestore.yAxis[axisIdx].type === 'category') {
-                                axisData = optionRestore.yAxis[axisIdx].data;
-                                mAxisData = magicOption.yAxis[axisIdx].data;
-
-                                axisData[inMethod](additionData);
-                                mAxisData[inMethod](additionData);
-                                if (!dataGrow) {
-                                    axisData[outMethod]();
-                                    mAxisData[outMethod]();
-                                }
-                            }
-                        }
                     }
-
-                    // 同步图表内状态，动画需要
-                    this._option.series[seriesIdx].data = magicOption.series[seriesIdx].data;
-                }
-            }
-            
-            this._zr.clearAnimation();
-            var chartList = this._chartList;
-            for (var i = 0, l = chartList.length; i < l; i++) {
-                if (magicOption.addDataAnimation && chartList[i].addDataAnimation) {
-                    chartList[i].addDataAnimation(params);
-                }
-            }
-
-            // dataZoom同步数据
-            this.component.dataZoom && this.component.dataZoom.syncOption(magicOption);
-            
-            this._option = magicOption;
-            var self = this;
-            setTimeout(function (){
-                if (!self._zr) {
-                    return; // 已经被释放
-                }
-                self._zr.clearAnimation();
-                for (var i = 0, l = chartList.length; i < l; i++) {
-                    // 有addData动画就去掉过渡动画
-                    chartList[i].motionlessOnce = 
-                        magicOption.addDataAnimation && chartList[i].addDataAnimation;
-                }
-                self._messageCenter.dispatch(
-                    ecConfig.EVENT.REFRESH,
-                    null,
-                    {option: magicOption},
-                    self
-                );
-            }, magicOption.addDataAnimation ? magicOption.animationDurationUpdate : 0);
-            return this;
-        },
-
-        /**
-         * 动态[标注 | 标线]添加
-         * @param {number} seriesIdx 系列索引
-         * @param {Object} markData [标注 | 标线]对象，支持多个
-         */
-        addMarkPoint: function (seriesIdx, markData) {
-            return this._addMark(seriesIdx, markData, 'markPoint');
-        },
-        
-        addMarkLine: function (seriesIdx, markData) {
-            return this._addMark(seriesIdx, markData, 'markLine');
-        },
-        
-        _addMark: function (seriesIdx, markData, markType) {
-            var series = this._option.series;
-            var seriesItem;
-
-            if (series && (seriesItem = series[seriesIdx])) {
-                var seriesR = this._optionRestore.series;
-                var seriesRItem = seriesR[seriesIdx];
-                var markOpt = seriesItem[markType];
-                var markOptR = seriesRItem[markType];
-
-                markOpt = seriesItem[markType] = markOpt || {data: []};
-                markOptR = seriesRItem[markType] = markOptR || {data: []};
-
-                for (var key in markData) {
-                    if (key === 'data') {
-                        // 数据concat
-                        markOpt.data = markOpt.data.concat(markData.data);
-                        markOptR.data = markOptR.data.concat(markData.data);
+                    if (dataKeys.hasOwnProperty(key)) {
+                        dataQuery[key] = val;
+                        reserved = true;
                     }
-                    else if (typeof markData[key] != 'object' || markOpt[key] == null) {
-                        // 简单类型或新值直接赋值
-                        markOpt[key] = markOptR[key] = markData[key];
+                    if (!reserved) {
+                        otherQuery[key] = val;
                     }
-                    else {
-                        // 非数据的复杂对象merge
-                        zrUtil.merge(markOpt[key], markData[key], true);
-                        zrUtil.merge(markOptR[key], markData[key], true);
-                    }
-                }
-                
-                var chart = this.chart[seriesItem.type];
-                chart && chart.addMark(seriesIdx, markData, markType);
+                });
             }
 
-            return this;
-        },
-        
-        /**
-         * 动态[标注 | 标线]删除
-         * @param {number} seriesIdx 系列索引
-         * @param {string} markName [标注 | 标线]名称
-         */
-        delMarkPoint: function (seriesIdx, markName) {
-            return this._delMark(seriesIdx, markName, 'markPoint');
-        },
-        
-        delMarkLine: function (seriesIdx, markName) {
-            return this._delMark(seriesIdx, markName, 'markLine');
-        },
-        
-        _delMark: function (seriesIdx, markName, markType) {
-            var series = this._option.series;
-            var seriesItem;
-            var mark;
-            var dataArray;
-
-            if (!(
-                    series 
-                    && (seriesItem = series[seriesIdx]) 
-                    && (mark = seriesItem[markType])
-                    && (dataArray = mark.data)
-                )
-            ) {
-                return this;
-            }
-
-            markName = markName.split(' > ');
-            var targetIndex = -1;
-            
-            for (var i = 0, l = dataArray.length; i < l; i++) {
-                var dataItem = dataArray[i];
-                if (dataItem instanceof Array) {
-                    if (dataItem[0].name === markName[0]
-                        && dataItem[1].name === markName[1]
-                    ) {
-                        targetIndex = i;
-                        break;
-                    }
-                }
-                else if (dataItem.name === markName[0]) {
-                    targetIndex = i;
-                    break;
-                }
-            }
-            
-            if (targetIndex > -1) {
-                dataArray.splice(targetIndex, 1);
-                this._optionRestore.series[seriesIdx][markType].data.splice(targetIndex, 1);
-
-                var chart = this.chart[seriesItem.type];
-                chart && chart.delMark(seriesIdx, markName.join(' > '), markType);
-            }
-            
-            return this;
-        },
-        
-        /**
-         * 获取当前dom 
-         */
-        getDom: function () {
-            return this.dom;
-        },
-        
-        /**
-         * 获取当前zrender实例，可用于添加额为的shape和深度控制 
-         */
-        getZrender: function () {
-            return this._zr;
-        },
-
-        /**
-         * 获取Base64图片dataURL
-         * @param {string} imgType 图片类型，支持png|jpeg，默认为png
-         * @return imgDataURL
-         */
-        getDataURL: function (imgType) {
-            if (!_canvasSupported) {
-                return '';
-            }
-
-            if (this._chartList.length === 0) {
-                // 渲染为图片
-                var imgId = 'IMG' + this.id;
-                var img = document.getElementById(imgId);
-                if (img) {
-                    return img.src;
-                }
-            }
-
-            // 清除可能存在的tooltip元素
-            var tooltip = this.component.tooltip;
-            tooltip && tooltip.hideTip();
-                
-            switch (imgType) {
-                case 'jpeg':
-                    break;
-                default:
-                    imgType = 'png';
-            }
-
-            var bgColor = this._option.backgroundColor;
-            if (bgColor && bgColor.replace(' ','') === 'rgba(0,0,0,0)') {
-                bgColor = '#fff';
-            }
-
-            return this._zr.toDataURL('image/' + imgType, bgColor); 
-        },
-
-        /**
-         * 获取img
-         * @param {string} imgType 图片类型，支持png|jpeg，默认为png
-         * @return img dom
-         */
-        getImage: function (imgType) {
-            var title = this._optionRestore.title;
-            var imgDom = document.createElement('img');
-            imgDom.src = this.getDataURL(imgType);
-            imgDom.title = (title && title.text) || 'ECharts';
-            return imgDom;
-        },
-        
-        /**
-         * 获取多图联动的Base64图片dataURL
-         * @param {string} imgType 图片类型，支持png|jpeg，默认为png
-         * @return imgDataURL
-         */
-        getConnectedDataURL: function (imgType) {
-            if (!this.isConnected()) {
-                return this.getDataURL(imgType);
-            }
-            
-            var tempDom = this.dom;
-            var imgList = {
-                'self': {
-                    img: this.getDataURL(imgType),
-                    left: tempDom.offsetLeft,
-                    top: tempDom.offsetTop,
-                    right: tempDom.offsetLeft + tempDom.offsetWidth,
-                    bottom: tempDom.offsetTop + tempDom.offsetHeight
-                }
-            };
-
-            var minLeft = imgList.self.left;
-            var minTop = imgList.self.top;
-            var maxRight = imgList.self.right;
-            var maxBottom = imgList.self.bottom;
-
-            for (var c in this._connected) {
-                tempDom = this._connected[c].getDom();
-                imgList[c] = {
-                    img: this._connected[c].getDataURL(imgType),
-                    left: tempDom.offsetLeft,
-                    top: tempDom.offsetTop,
-                    right: tempDom.offsetLeft + tempDom.offsetWidth,
-                    bottom: tempDom.offsetTop + tempDom.offsetHeight
-                };
-
-                minLeft = Math.min(minLeft, imgList[c].left);
-                minTop = Math.min(minTop, imgList[c].top);
-                maxRight = Math.max(maxRight, imgList[c].right);
-                maxBottom = Math.max(maxBottom, imgList[c].bottom);
-            }
-            
-            var zrDom = document.createElement('div');
-            zrDom.style.position = 'absolute';
-            zrDom.style.left = '-4000px';
-            zrDom.style.width = (maxRight - minLeft) + 'px';
-            zrDom.style.height = (maxBottom - minTop) + 'px';
-            document.body.appendChild(zrDom);
-            
-            var zrImg = require('zrender').init(zrDom);
-            
-            var ImageShape = require('zrender/shape/Image');
-            for (var c in imgList) {
-                zrImg.addShape(new ImageShape({
-                    style: {
-                        x: imgList[c].left - minLeft,
-                        y: imgList[c].top - minTop,
-                        image: imgList[c].img
-                    }
-                }));
-            }
-            
-            zrImg.render();
-            var bgColor = this._option.backgroundColor;
-            if (bgColor && bgColor.replace(/ /g, '') === 'rgba(0,0,0,0)') {
-                bgColor = '#fff';
-            }
-            
-            var image = zrImg.toDataURL('image/png', bgColor);
-            
-            setTimeout(function () {
-                zrImg.dispose();
-                zrDom.parentNode.removeChild(zrDom);
-                zrDom = null;
-            }, 100);
-            
-            return image;
-        },
-        
-        /**
-         * 获取多图联动的img
-         * @param {string} imgType 图片类型，支持png|jpeg，默认为png
-         * @return img dom
-         */
-        getConnectedImage: function (imgType) {
-            var title = this._optionRestore.title;
-            var imgDom = document.createElement('img');
-            imgDom.src = this.getConnectedDataURL(imgType);
-            imgDom.title = (title && title.text) || 'ECharts';
-            return imgDom;
-        },
-
-        /**
-         * 外部接口绑定事件
-         * @param {Object} eventName 事件名称
-         * @param {Object} eventListener 事件响应函数
-         */
-        on: function (eventName, eventListener) {
-            this._messageCenterOutSide.bind(eventName, eventListener, this);
-            return this;
-        },
-
-        /**
-         * 外部接口解除事件绑定
-         * @param {Object} eventName 事件名称
-         * @param {Object} eventListener 事件响应函数
-         */
-        un: function (eventName, eventListener) {
-            this._messageCenterOutSide.unbind(eventName, eventListener);
-            return this;
-        },
-        
-        /**
-         * 多图联动 
-         * @param connectTarget{ECharts | Array <ECharts>} connectTarget 联动目标
-         */
-        connect: function (connectTarget) {
-            if (!connectTarget) {
-                return this;
-            }
-            
-            if (!this._connected) {
-                this._connected = {};
-            }
-            
-            if (connectTarget instanceof Array) {
-                for (var i = 0, l = connectTarget.length; i < l; i++) {
-                    this._connected[connectTarget[i].id] = connectTarget[i];
-                }
-            }
-            else {
-                this._connected[connectTarget.id] = connectTarget;
-            }
-            
-            return this;
-        },
-        
-        /**
-         * 解除多图联动 
-         * @param connectTarget{ECharts | Array <ECharts>} connectTarget 解除联动目标
-         */
-        disConnect: function (connectTarget) {
-            if (!connectTarget || !this._connected) {
-                return this;
-            }
-            
-            if (connectTarget instanceof Array) {
-                for (var i = 0, l = connectTarget.length; i < l; i++) {
-                    delete this._connected[connectTarget[i].id];
-                }
-            }
-            else {
-                delete this._connected[connectTarget.id];
-            }
-            
-            for (var k in this._connected) {
-                return k, this; // 非空
-            }
-            
-            // 空，转为标志位
-            this._connected = false;
-            return this;
-        },
-        
-        /**
-         * 联动事件响应 
-         */
-        connectedEventHandler: function (param) {
-            if (param.__echartsId != this.id) {
-                // 来自其他联动图表的事件
-                this._onevent(param);
-            }
-        },
-        
-        /**
-         * 是否存在多图联动 
-         */
-        isConnected: function () {
-            return !!this._connected;
-        },
-        
-        /**
-         * 显示loading过渡 
-         * @param {Object} loadingOption
-         */
-        showLoading: function (loadingOption) {
-            var effectList = {
-                bar: require('zrender/loadingEffect/Bar'),
-                bubble: require('zrender/loadingEffect/Bubble'),
-                dynamicLine: require('zrender/loadingEffect/DynamicLine'),
-                ring: require('zrender/loadingEffect/Ring'),
-                spin: require('zrender/loadingEffect/Spin'),
-                whirling: require('zrender/loadingEffect/Whirling')
-            };
-            this._toolbox.hideDataView();
-
-            loadingOption = loadingOption || {};
-
-            var textStyle = loadingOption.textStyle || {};
-            loadingOption.textStyle = textStyle;
-
-            var finalTextStyle = zrUtil.merge(
-                zrUtil.clone(textStyle),
-                this._themeConfig.textStyle
-            );
-            textStyle.textFont = finalTextStyle.fontStyle + ' '
-                                 + finalTextStyle.fontWeight + ' '
-                                 + finalTextStyle.fontSize + 'px '
-                                 + finalTextStyle.fontFamily;
-
-            textStyle.text = loadingOption.text || this._themeConfig.loadingText;
-
-            if (loadingOption.x != null) {
-                textStyle.x = loadingOption.x;
-            }
-            if (loadingOption.y != null) {
-                textStyle.y = loadingOption.y;
-            }
-            
-            loadingOption.effectOption = loadingOption.effectOption || {};
-            loadingOption.effectOption.textStyle = textStyle;
-            
-            var Effect = loadingOption.effect;
-            if (typeof Effect === 'string' || Effect == null) {
-                Effect =  effectList[loadingOption.effect || this._themeConfig.loadingEffect];
-            }
-            this._zr.showLoading(new Effect(loadingOption.effectOption));
-            return this;
-        },
-
-        /**
-         * 隐藏loading过渡 
-         */
-        hideLoading: function () {
-            this._zr.hideLoading();
-            return this;
-        },
-        
-        /**
-         * 主题设置 
-         */
-        setTheme: function (theme) {
-            if (theme) {
-               if (typeof theme === 'string') {
-                    // 默认主题
-                    switch (theme) {
-                        case 'macarons':
-                            theme = require('./theme/macarons');
-                            break;
-                        case 'infographic':
-                            theme = require('./theme/infographic');
-                            break;
-                        default:
-                            theme = {}; // require('./theme/default');
-                    }
-                }
-                else {
-                    theme = theme || {};
-                }
-                
-                // 复位默认配置
-                // this._themeConfig会被别的对象引用持有
-                // 所以不能改成this._themeConfig = {};
-                for (var key in this._themeConfig) {
-                    delete this._themeConfig[key];
-                }
-                for (var key in ecConfig) {
-                    this._themeConfig[key] = zrUtil.clone(ecConfig[key]);
-                }
-                
-                // 颜色数组随theme，不merge
-                theme.color && (this._themeConfig.color = []);
-                
-                // 默认标志图形类型列表，不merge
-                theme.symbolList && (this._themeConfig.symbolList = []);
-                
-                // 应用新主题
-                zrUtil.merge(this._themeConfig, zrUtil.clone(theme), true);
-            }
-            
-            if (!_canvasSupported) {   // IE8-
-                this._themeConfig.textStyle.fontFamily = this._themeConfig.textStyle.fontFamily2;
-            }
-            
-            this._timeline && this._timeline.setTheme(true);
-            this._optionRestore && this.restore();
-        },
-
-        /**
-         * 视图区域大小变化更新，不默认绑定，供使用方按需调用 
-         */
-        resize: function () {
-            var self = this;
-            return function(){
-                self._clearEffect();
-                self._zr.resize();
-                if (self._option && self._option.renderAsImage && _canvasSupported) {
-                    // 渲染为图片重走render模式
-                    self._render(self._option);
-                    return self;
-                }
-                // 停止动画
-                self._zr.clearAnimation();
-                self._island.resize();
-                self._toolbox.resize();
-                self._timeline && self._timeline.resize();
-                // 先来后到，不能仅刷新自己，也不能在上一个循环中刷新，如坐标系数据改变会影响其他图表的大小
-                // 所以安顺序刷新各种图表，图表内部refresh优化无需更新则不更新~
-                for (var i = 0, l = self._chartList.length; i < l; i++) {
-                    self._chartList[i].resize && self._chartList[i].resize();
-                }
-                self.component.grid && self.component.grid.refixAxisShape(self.component);
-                self._zr.refresh();
-                self._messageCenter.dispatch(ecConfig.EVENT.RESIZE, null, null, self);
-                return self;
+            return {
+                cptQuery: cptQuery,
+                dataQuery: dataQuery,
+                otherQuery: otherQuery
             };
         },
-        
-        _clearEffect: function() {
-            this._zr.modLayer(ecConfig.EFFECT_ZLEVEL, { motionBlur: false });
-            this._zr.painter.clearLayer(ecConfig.EFFECT_ZLEVEL);
-        },
-        
-        /**
-         * 清除已渲染内容 ，clear后echarts实例可用
-         */
-        clear: function () {
-            this._disposeChartList();
-            this._zr.clear();
-            this._option = {};
-            this._optionRestore = {};
-            this.dom.style.backgroundColor = null;
-            return this;
-        },
 
-        /**
-         * 释放，dispose后echarts实例不可用
-         */
-        dispose: function () {
-            var key = this.dom.getAttribute(DOM_ATTRIBUTE_KEY);
-            key && delete _instances[key];
-        
-            this._island.dispose();
-            this._toolbox.dispose();
-            this._timeline && this._timeline.dispose();
-            this._messageCenter.unbind();
-            this.clear();
-            this._zr.dispose();
-            this._zr = null;
+        filter: function (eventType, query, args) {
+            // They should be assigned before each trigger call.
+            var targetEl = this.targetEl;
+            var packedEvent = this.packedEvent;
+            var model = this.model;
+            var view = this.view;
+
+            // For event like 'globalout'.
+            if (!model || !view) {
+                return true;
+            }
+
+            var cptQuery = query.cptQuery;
+            var dataQuery = query.dataQuery;
+
+            return check(cptQuery, model, 'mainType')
+                && check(cptQuery, model, 'subType')
+                && check(cptQuery, model, 'index', 'componentIndex')
+                && check(cptQuery, model, 'name')
+                && check(cptQuery, model, 'id')
+                && check(dataQuery, packedEvent, 'name')
+                && check(dataQuery, packedEvent, 'dataIndex')
+                && check(dataQuery, packedEvent, 'dataType')
+                && (!view.filterForExposedEvent || view.filterForExposedEvent(
+                    eventType, query.otherQuery, targetEl, packedEvent
+                ));
         }
     };
 
-    return self;
-});
+    function check(query, host, prop, propOnHost) {
+        return query[prop] == null || host[propOnHost || prop] === query[prop];
+    }
+}
+
+/**
+ * @type {Object} key: actionType.
+ * @inner
+ */
+var actions = {};
+
+/**
+ * Map eventType to actionType
+ * @type {Object}
+ */
+var eventActionMap = {};
+
+/**
+ * Data processor functions of each stage
+ * @type {Array.<Object.<string, Function>>}
+ * @inner
+ */
+var dataProcessorFuncs = [];
+
+/**
+ * @type {Array.<Function>}
+ * @inner
+ */
+var optionPreprocessorFuncs = [];
+
+/**
+ * @type {Array.<Function>}
+ * @inner
+ */
+var postUpdateFuncs = [];
+
+/**
+ * Visual encoding functions of each stage
+ * @type {Array.<Object.<string, Function>>}
+ */
+var visualFuncs = [];
+
+/**
+ * Theme storage
+ * @type {Object.<key, Object>}
+ */
+var themeStorage = {};
+/**
+ * Loading effects
+ */
+var loadingEffects = {};
+
+var instances = {};
+var connectedGroups = {};
+
+var idBase = new Date() - 0;
+var groupIdBase = new Date() - 0;
+var DOM_ATTRIBUTE_KEY = '_echarts_instance_';
+
+function enableConnect(chart) {
+    var STATUS_PENDING = 0;
+    var STATUS_UPDATING = 1;
+    var STATUS_UPDATED = 2;
+    var STATUS_KEY = '__connectUpdateStatus';
+
+    function updateConnectedChartsStatus(charts, status) {
+        for (var i = 0; i < charts.length; i++) {
+            var otherChart = charts[i];
+            otherChart[STATUS_KEY] = status;
+        }
+    }
+
+    each(eventActionMap, function (actionType, eventType) {
+        chart._messageCenter.on(eventType, function (event) {
+            if (connectedGroups[chart.group] && chart[STATUS_KEY] !== STATUS_PENDING) {
+                if (event && event.escapeConnect) {
+                    return;
+                }
+
+                var action = chart.makeActionFromEvent(event);
+                var otherCharts = [];
+
+                each(instances, function (otherChart) {
+                    if (otherChart !== chart && otherChart.group === chart.group) {
+                        otherCharts.push(otherChart);
+                    }
+                });
+
+                updateConnectedChartsStatus(otherCharts, STATUS_PENDING);
+                each(otherCharts, function (otherChart) {
+                    if (otherChart[STATUS_KEY] !== STATUS_UPDATING) {
+                        otherChart.dispatchAction(action);
+                    }
+                });
+                updateConnectedChartsStatus(otherCharts, STATUS_UPDATED);
+            }
+        });
+    });
+}
+
+/**
+ * @param {HTMLElement} dom
+ * @param {Object} [theme]
+ * @param {Object} opts
+ * @param {number} [opts.devicePixelRatio] Use window.devicePixelRatio by default
+ * @param {string} [opts.renderer] Currently only 'canvas' is supported.
+ * @param {number} [opts.width] Use clientWidth of the input `dom` by default.
+ *                              Can be 'auto' (the same as null/undefined)
+ * @param {number} [opts.height] Use clientHeight of the input `dom` by default.
+ *                               Can be 'auto' (the same as null/undefined)
+ */
+export function init(dom, theme, opts) {
+    if (__DEV__) {
+        // Check version
+        if ((zrender.version.replace('.', '') - 0) < (dependencies.zrender.replace('.', '') - 0)) {
+            throw new Error(
+                'zrender/src ' + zrender.version
+                + ' is too old for ECharts ' + version
+                + '. Current version need ZRender '
+                + dependencies.zrender + '+'
+            );
+        }
+
+        if (!dom) {
+            throw new Error('Initialize failed: invalid dom.');
+        }
+    }
+
+    var existInstance = getInstanceByDom(dom);
+    if (existInstance) {
+        if (__DEV__) {
+            console.warn('There is a chart instance already initialized on the dom.');
+        }
+        return existInstance;
+    }
+
+    if (__DEV__) {
+        if (zrUtil.isDom(dom)
+            && dom.nodeName.toUpperCase() !== 'CANVAS'
+            && (
+                (!dom.clientWidth && (!opts || opts.width == null))
+                || (!dom.clientHeight && (!opts || opts.height == null))
+            )
+        ) {
+            console.warn('Can\'t get dom width or height');
+        }
+    }
+
+    var chart = new ECharts(dom, theme, opts);
+    chart.id = 'ec_' + idBase++;
+    instances[chart.id] = chart;
+
+    modelUtil.setAttribute(dom, DOM_ATTRIBUTE_KEY, chart.id);
+
+    enableConnect(chart);
+
+    return chart;
+}
+
+/**
+ * @return {string|Array.<module:echarts~ECharts>} groupId
+ */
+export function connect(groupId) {
+    // Is array of charts
+    if (zrUtil.isArray(groupId)) {
+        var charts = groupId;
+        groupId = null;
+        // If any chart has group
+        each(charts, function (chart) {
+            if (chart.group != null) {
+                groupId = chart.group;
+            }
+        });
+        groupId = groupId || ('g_' + groupIdBase++);
+        each(charts, function (chart) {
+            chart.group = groupId;
+        });
+    }
+    connectedGroups[groupId] = true;
+    return groupId;
+}
+
+/**
+ * @DEPRECATED
+ * @return {string} groupId
+ */
+export function disConnect(groupId) {
+    connectedGroups[groupId] = false;
+}
+
+/**
+ * @return {string} groupId
+ */
+export var disconnect = disConnect;
+
+/**
+ * Dispose a chart instance
+ * @param  {module:echarts~ECharts|HTMLDomElement|string} chart
+ */
+export function dispose(chart) {
+    if (typeof chart === 'string') {
+        chart = instances[chart];
+    }
+    else if (!(chart instanceof ECharts)){
+        // Try to treat as dom
+        chart = getInstanceByDom(chart);
+    }
+    if ((chart instanceof ECharts) && !chart.isDisposed()) {
+        chart.dispose();
+    }
+}
+
+/**
+ * @param  {HTMLElement} dom
+ * @return {echarts~ECharts}
+ */
+export function getInstanceByDom(dom) {
+    return instances[modelUtil.getAttribute(dom, DOM_ATTRIBUTE_KEY)];
+}
+
+/**
+ * @param {string} key
+ * @return {echarts~ECharts}
+ */
+export function getInstanceById(key) {
+    return instances[key];
+}
+
+/**
+ * Register theme
+ */
+export function registerTheme(name, theme) {
+    themeStorage[name] = theme;
+}
+
+/**
+ * Register option preprocessor
+ * @param {Function} preprocessorFunc
+ */
+export function registerPreprocessor(preprocessorFunc) {
+    optionPreprocessorFuncs.push(preprocessorFunc);
+}
+
+/**
+ * @param {number} [priority=1000]
+ * @param {Object|Function} processor
+ */
+export function registerProcessor(priority, processor) {
+    normalizeRegister(dataProcessorFuncs, priority, processor, PRIORITY_PROCESSOR_FILTER);
+}
+
+/**
+ * Register postUpdater
+ * @param {Function} postUpdateFunc
+ */
+export function registerPostUpdate(postUpdateFunc) {
+    postUpdateFuncs.push(postUpdateFunc);
+}
+
+/**
+ * Usage:
+ * registerAction('someAction', 'someEvent', function () { ... });
+ * registerAction('someAction', function () { ... });
+ * registerAction(
+ *     {type: 'someAction', event: 'someEvent', update: 'updateView'},
+ *     function () { ... }
+ * );
+ *
+ * @param {(string|Object)} actionInfo
+ * @param {string} actionInfo.type
+ * @param {string} [actionInfo.event]
+ * @param {string} [actionInfo.update]
+ * @param {string} [eventName]
+ * @param {Function} action
+ */
+export function registerAction(actionInfo, eventName, action) {
+    if (typeof eventName === 'function') {
+        action = eventName;
+        eventName = '';
+    }
+    var actionType = isObject(actionInfo)
+        ? actionInfo.type
+        : ([actionInfo, actionInfo = {
+            event: eventName
+        }][0]);
+
+    // Event name is all lowercase
+    actionInfo.event = (actionInfo.event || actionType).toLowerCase();
+    eventName = actionInfo.event;
+
+    // Validate action type and event name.
+    assert(ACTION_REG.test(actionType) && ACTION_REG.test(eventName));
+
+    if (!actions[actionType]) {
+        actions[actionType] = {action: action, actionInfo: actionInfo};
+    }
+    eventActionMap[eventName] = actionType;
+}
+
+/**
+ * @param {string} type
+ * @param {*} CoordinateSystem
+ */
+export function registerCoordinateSystem(type, CoordinateSystem) {
+    CoordinateSystemManager.register(type, CoordinateSystem);
+}
+
+/**
+ * Get dimensions of specified coordinate system.
+ * @param {string} type
+ * @return {Array.<string|Object>}
+ */
+export function getCoordinateSystemDimensions(type) {
+    var coordSysCreator = CoordinateSystemManager.get(type);
+    if (coordSysCreator) {
+        return coordSysCreator.getDimensionsInfo
+                ? coordSysCreator.getDimensionsInfo()
+                : coordSysCreator.dimensions.slice();
+    }
+}
+
+/**
+ * Layout is a special stage of visual encoding
+ * Most visual encoding like color are common for different chart
+ * But each chart has it's own layout algorithm
+ *
+ * @param {number} [priority=1000]
+ * @param {Function} layoutTask
+ */
+export function registerLayout(priority, layoutTask) {
+    normalizeRegister(visualFuncs, priority, layoutTask, PRIORITY_VISUAL_LAYOUT, 'layout');
+}
+
+/**
+ * @param {number} [priority=3000]
+ * @param {module:echarts/stream/Task} visualTask
+ */
+export function registerVisual(priority, visualTask) {
+    normalizeRegister(visualFuncs, priority, visualTask, PRIORITY_VISUAL_CHART, 'visual');
+}
+
+/**
+ * @param {Object|Function} fn: {seriesType, createOnAllSeries, performRawSeries, reset}
+ */
+function normalizeRegister(targetList, priority, fn, defaultPriority, visualType) {
+    if (isFunction(priority) || isObject(priority)) {
+        fn = priority;
+        priority = defaultPriority;
+    }
+
+    if (__DEV__) {
+        if (isNaN(priority) || priority == null) {
+            throw new Error('Illegal priority');
+        }
+        // Check duplicate
+        each(targetList, function (wrap) {
+            assert(wrap.__raw !== fn);
+        });
+    }
+
+    var stageHandler = Scheduler.wrapStageHandler(fn, visualType);
+
+    stageHandler.__prio = priority;
+    stageHandler.__raw = fn;
+    targetList.push(stageHandler);
+
+    return stageHandler;
+}
+
+/**
+ * @param {string} name
+ */
+export function registerLoading(name, loadingFx) {
+    loadingEffects[name] = loadingFx;
+}
+
+/**
+ * @param {Object} opts
+ * @param {string} [superClass]
+ */
+export function extendComponentModel(opts/*, superClass*/) {
+    // var Clazz = ComponentModel;
+    // if (superClass) {
+    //     var classType = parseClassType(superClass);
+    //     Clazz = ComponentModel.getClass(classType.main, classType.sub, true);
+    // }
+    return ComponentModel.extend(opts);
+}
+
+/**
+ * @param {Object} opts
+ * @param {string} [superClass]
+ */
+export function extendComponentView(opts/*, superClass*/) {
+    // var Clazz = ComponentView;
+    // if (superClass) {
+    //     var classType = parseClassType(superClass);
+    //     Clazz = ComponentView.getClass(classType.main, classType.sub, true);
+    // }
+    return ComponentView.extend(opts);
+}
+
+/**
+ * @param {Object} opts
+ * @param {string} [superClass]
+ */
+export function extendSeriesModel(opts/*, superClass*/) {
+    // var Clazz = SeriesModel;
+    // if (superClass) {
+    //     superClass = 'series.' + superClass.replace('series.', '');
+    //     var classType = parseClassType(superClass);
+    //     Clazz = ComponentModel.getClass(classType.main, classType.sub, true);
+    // }
+    return SeriesModel.extend(opts);
+}
+
+/**
+ * @param {Object} opts
+ * @param {string} [superClass]
+ */
+export function extendChartView(opts/*, superClass*/) {
+    // var Clazz = ChartView;
+    // if (superClass) {
+    //     superClass = superClass.replace('series.', '');
+    //     var classType = parseClassType(superClass);
+    //     Clazz = ChartView.getClass(classType.main, true);
+    // }
+    return ChartView.extend(opts);
+}
+
+/**
+ * ZRender need a canvas context to do measureText.
+ * But in node environment canvas may be created by node-canvas.
+ * So we need to specify how to create a canvas instead of using document.createElement('canvas')
+ *
+ * Be careful of using it in the browser.
+ *
+ * @param {Function} creator
+ * @example
+ *     var Canvas = require('canvas');
+ *     var echarts = require('echarts');
+ *     echarts.setCanvasCreator(function () {
+ *         // Small size is enough.
+ *         return new Canvas(32, 32);
+ *     });
+ */
+export function setCanvasCreator(creator) {
+    zrUtil.$override('createCanvas', creator);
+}
+
+/**
+ * @param {string} mapName
+ * @param {Array.<Object>|Object|string} geoJson
+ * @param {Object} [specialAreas]
+ *
+ * @example GeoJSON
+ *     $.get('USA.json', function (geoJson) {
+ *         echarts.registerMap('USA', geoJson);
+ *         // Or
+ *         echarts.registerMap('USA', {
+ *             geoJson: geoJson,
+ *             specialAreas: {}
+ *         })
+ *     });
+ *
+ *     $.get('airport.svg', function (svg) {
+ *         echarts.registerMap('airport', {
+ *             svg: svg
+ *         }
+ *     });
+ *
+ *     echarts.registerMap('eu', [
+ *         {svg: eu-topographic.svg},
+ *         {geoJSON: eu.json}
+ *     ])
+ */
+export function registerMap(mapName, geoJson, specialAreas) {
+    mapDataStorage.registerMap(mapName, geoJson, specialAreas);
+}
+
+/**
+ * @param {string} mapName
+ * @return {Object}
+ */
+export function getMap(mapName) {
+    // For backward compatibility, only return the first one.
+    var records = mapDataStorage.retrieveMap(mapName);
+    return records && records[0] && {
+        geoJson: records[0].geoJSON,
+        specialAreas: records[0].specialAreas
+    };
+}
+
+registerVisual(PRIORITY_VISUAL_GLOBAL, seriesColor);
+registerPreprocessor(backwardCompat);
+registerProcessor(PRIORITY_PROCESSOR_STATISTIC, dataStack);
+registerLoading('default', loadingDefault);
+
+// Default actions
+
+registerAction({
+    type: 'highlight',
+    event: 'highlight',
+    update: 'highlight'
+}, zrUtil.noop);
+
+registerAction({
+    type: 'downplay',
+    event: 'downplay',
+    update: 'downplay'
+}, zrUtil.noop);
+
+// Default theme
+registerTheme('light', lightTheme);
+registerTheme('dark', darkTheme);
+
+// For backward compatibility, where the namespace `dataTool` will
+// be mounted on `echarts` is the extension `dataTool` is imported.
+export var dataTool = {};
